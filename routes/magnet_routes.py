@@ -499,6 +499,65 @@ def assign_magnet():
             # Standard GET request (no prefill)
             return render_template('magnet_assign.html', step='search')
 
+def _fetch_tmdb_seasons_fallback(tmdb_id) -> Optional[dict]:
+    """Fetch TV season/episode data from TMDB, as a fallback when Trakt is
+    unavailable (e.g. 403 / rate-limited).
+
+    Returns the same structure the item builders expect:
+      {season_number: {'episodes': {episode_number: {...}}, 'episode_count': N}}
+    or None if TMDB is unreachable / no key.
+    """
+    from utilities.settings import get_setting
+    import requests as _req
+    if not tmdb_id:
+        return None
+    api_key = get_setting('TMDB', 'api_key')
+    if not api_key:
+        logging.warning("TMDB season fallback skipped — no TMDB API key configured")
+        return None
+    base = "https://api.themoviedb.org/3"
+    try:
+        show = _req.get(f"{base}/tv/{tmdb_id}", params={'api_key': api_key}, timeout=10)
+        show.raise_for_status()
+        show_data = show.json()
+        # Season list from the show (includes season 0 = specials)
+        season_nums = [
+            s.get('season_number') for s in show_data.get('seasons', [])
+            if isinstance(s.get('season_number'), int)
+        ]
+        if not season_nums:
+            n = show_data.get('number_of_seasons') or show_data.get('number_of_episodes') and 1 or 0
+            season_nums = list(range(1, int(n) + 1)) if n else []
+        result: Dict[str, Any] = {}
+        for snum in season_nums:
+            sr = _req.get(f"{base}/tv/{tmdb_id}/season/{snum}",
+                          params={'api_key': api_key}, timeout=10)
+            if sr.status_code != 200:
+                logging.debug(f"TMDB season fallback: season {snum} returned {sr.status_code} — skipping")
+                continue
+            ep_dict = {}
+            for ep in sr.json().get('episodes', []):
+                en = ep.get('episode_number')
+                if en is None:
+                    continue
+                ext = ep.get('external_ids') or {}
+                ep_dict[en] = {
+                    'title': ep.get('name', ''),
+                    'overview': ep.get('overview', ''),
+                    'runtime': ep.get('runtime', 0),
+                    'first_aired': ep.get('air_date'),
+                    'imdb_id': ext.get('imdb_id') if isinstance(ext, dict) else None,
+                    'tmdb_id': str(ep.get('id')) if ep.get('id') else None,
+                    'tvdb_id': ext.get('tvdb_id') if isinstance(ext, dict) else None,
+                    'absolute': ep.get('episode_number'),
+                }
+            result[snum] = {'episode_count': len(ep_dict), 'episodes': ep_dict}
+        return result if result else None
+    except Exception as e:
+        logging.error(f"TMDB season fallback failed for {tmdb_id}: {e}")
+        return None
+
+
 @magnet_bp.route('/prepare_manual_assignment', methods=['POST'])
 @admin_required
 def prepare_manual_assignment():
@@ -803,6 +862,18 @@ def prepare_manual_assignment():
             except Exception as e:
                 # Log but don't necessarily fail, maybe proceed without detailed episode titles
                 logging.error(f"Error fetching season data from Trakt (non-critical): {str(e)}")
+
+            # TMDB fallback — Trakt is often unavailable (403 / rate-limited).
+            # TMDb is configured and reliable, so fetch the show's seasons there
+            # so "all" / "seasons" selections can still build target items.
+            if not metadata.get('seasons') and metadata.get('tmdb_id'):
+                _tmdb_seasons = _fetch_tmdb_seasons_fallback(str(metadata['tmdb_id']))
+                if _tmdb_seasons:
+                    metadata['seasons'] = _tmdb_seasons
+                    logging.info(
+                        f"TMDB season fallback populated {len(_tmdb_seasons)} seasons "
+                        f"for {metadata.get('imdb_id')}"
+                    )
 
         # --- ADD LOGGING HERE ---
         logging.debug(f"Metadata seasons before creating items: {json.dumps(metadata.get('seasons', {}), indent=2)}")
