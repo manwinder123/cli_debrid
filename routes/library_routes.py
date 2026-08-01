@@ -1511,6 +1511,27 @@ def show_detail_data(media_id):
         # Get auto-ghostlist setting
         auto_ghostlist_enabled = get_setting('Library Manager', 'ghostlist_mode', False)
 
+        # Authoritative per-season episode counts from TMDB (one request per
+        # show-detail page). The frontend uses these to bound phantom/missing
+        # episode rows so a season with pathologically inflated or global/absolute
+        # episode numbers (common with anime) doesn't display hundreds of bogus
+        # "missing" episodes or trigger over-searching.
+        season_counts = {}
+        if show_data['tmdb_id'] and tmdb_api_key:
+            try:
+                import requests as _req
+                _ts = _req.get(
+                    f"https://api.themoviedb.org/3/tv/{show_data['tmdb_id']}",
+                    params={'api_key': tmdb_api_key}, timeout=10)
+                _ts.raise_for_status()
+                for _s in _ts.json().get('seasons', []):
+                    _sn = _s.get('season_number')
+                    _ec = _s.get('episode_count')
+                    if isinstance(_sn, int) and isinstance(_ec, int) and _ec > 0:
+                        season_counts[_sn] = _ec
+            except Exception as _ts_err:
+                logging.warning(f"Could not fetch TMDB season counts for {show_data['tmdb_id']}: {_ts_err}")
+
         # Fetch certification based on user's preferred region
         certification = ''
         if show_data['tmdb_id'] and tmdb_api_key:
@@ -1544,7 +1565,8 @@ def show_detail_data(media_id):
                 'total_size': total_size,
                 'auto_ghostlist_enabled': auto_ghostlist_enabled
             },
-            'seasons': seasons_list
+            'seasons': seasons_list,
+            'season_counts': season_counts
         })
 
     except Exception as e:

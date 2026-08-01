@@ -12,6 +12,7 @@ const API_COOLDOWN_MAX_SECONDS = 96;            // Maximum API cooldown period (
 // State management
 let showData = null;
 let seasonsData = [];
+let seasonCounts = {};
 let brokenFiles = new Set();  // Set of broken filenames from __unplayable__ folder
 
 // DOM elements
@@ -120,9 +121,10 @@ async function loadShowData() {
                 showData.title = showData.title.replace(new RegExp(`\\s*\\(${showData.year}\\)$`), '').trim();
             }
             seasonsData = data.seasons;
+            seasonCounts = data.season_counts || {};
 
             // Add phantom rows for missing episodes before stats calculation
-            addPhantomRowsToSeasonData(seasonsData);
+            addPhantomRowsToSeasonData(seasonsData, seasonCounts);
 
             renderShowHeader(showData);
             renderSeasons(seasonsData);
@@ -186,7 +188,8 @@ async function loadShowData() {
  * Add phantom rows for missing episodes to seasonsData before stats calculation
  * This ensures the "Get Missing" count includes gaps in episode numbering
  */
-function addPhantomRowsToSeasonData(seasons) {
+function addPhantomRowsToSeasonData(seasons, seasonCounts) {
+    seasonCounts = seasonCounts || {};
     seasons.forEach(season => {
         // Only process if season has episodes
         if (!season.episodes || season.episodes.length === 0) {
@@ -209,7 +212,21 @@ function addPhantomRowsToSeasonData(seasons) {
         const episodeNumbers = Object.keys(episodeGroups).map(n => parseInt(n));
         if (episodeNumbers.length > 0) {
             const minEp = Math.min(...episodeNumbers);
-            const maxEp = Math.max(...episodeNumbers);
+            let maxEp = Math.max(...episodeNumbers);
+
+            // Bound the phantom range by the AUTHORITATIVE per-season episode count
+            // from TMDB (when available). A season with pathologically inflated or
+            // global/absolute episode numbers (e.g. anime, or bad data like a season
+            // spanning 1-588) must NOT phantom-fill hundreds of bogus "missing"
+            // episodes — that both inflates the displayed count and can make
+            // cli_debrid target episodes that don't exist.
+            const authCount = seasonCounts[season.season_number];
+            if (authCount && Number.isInteger(authCount) && authCount > 0) {
+                const authMax = minEp + authCount - 1;
+                if (authMax < maxEp) {
+                    maxEp = authMax;
+                }
+            }
 
             // Add phantom episodes for gaps within the season's episode range
             for (let i = minEp; i <= maxEp; i++) {
