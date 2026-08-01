@@ -244,9 +244,25 @@ class TorboxProvider(DebridProvider):
                     return torrent_id
 
             if temp_file_path:
-                with open(temp_file_path, 'rb') as f:
-                    files = {'file': (os.path.basename(temp_file_path), f)}
-                    result = make_request('POST', '/torrents/createtorrent', self.api_key, files=files)
+                # A pasted magnet is often saved/uploaded as a *.torrent file. If
+                # the content is actually a magnet URI, add it via the magnet
+                # parameter instead of uploading an invalid torrent file — Torbox
+                # rejects that with 400 BOZO_TORRENT / "Invalid Torrent File".
+                magnet_from_file = None
+                try:
+                    with open(temp_file_path, 'rb') as f:
+                        head = f.read(2048)
+                    if head.strip().startswith(b'magnet:'):
+                        magnet_from_file = head.decode('utf-8', errors='replace').strip().splitlines()[0]
+                except OSError:
+                    magnet_from_file = None
+
+                if magnet_from_file:
+                    result = make_request('POST', '/torrents/createtorrent', self.api_key, data={'magnet': magnet_from_file})
+                else:
+                    with open(temp_file_path, 'rb') as f:
+                        files = {'file': (os.path.basename(temp_file_path), f)}
+                        result = make_request('POST', '/torrents/createtorrent', self.api_key, files=files)
             elif magnet_link and magnet_link.startswith('http'):
                 # HTTP URL (e.g. Jackett/Prowlarr) — download torrent file or detect magnet redirect
                 import tempfile as _tmp, requests as _req
@@ -394,10 +410,14 @@ class TorboxProvider(DebridProvider):
 
             return normalized
         except Exception as e:
-            if "404" in str(e):
+            err_str = str(e)
+            # Torbox returns 404/422 when the torrent id is no longer present in
+            # the user's mylist (removed / expired) — treat as removed, not an error.
+            if "404" in err_str or "422" in err_str:
                 self.update_status(torrent_id, TorrentStatus.REMOVED)
+                logging.debug(f"Torbox torrent {torrent_id} no longer in mylist: {err_str[:120]}")
             else:
-                logging.error(f"Error getting Torbox torrent info: {str(e)}")
+                logging.error(f"Error getting Torbox torrent info: {err_str}")
                 self.update_status(torrent_id, TorrentStatus.ERROR)
             return None
 
@@ -449,12 +469,20 @@ class TorboxProvider(DebridProvider):
             if info:
                 hash_value = info.get('hash', '').lower()
 
-            make_request(
-                'POST',
-                '/torrents/controltorrent',
-                self.api_key,
-                json_data={'operation': 'delete', 'torrent_id': int(torrent_id)},
-            )
+            try:
+                make_request(
+                    'POST',
+                    '/torrents/controltorrent',
+                    self.api_key,
+                    json_data={'operation': 'delete', 'torrent_id': torrent_id},
+                )
+            except Exception as delete_err:
+                # 404/422 = torrent already gone from the account — idempotent removal,
+                # not an error. Torbox IDs are alphanumeric strings; never int() them.
+                if '404' in str(delete_err) or '422' in str(delete_err):
+                    logging.debug(f"[Torbox] {torrent_id} already removed (delete: {str(delete_err)[:80]})")
+                else:
+                    raise
 
             self.update_status(torrent_id, TorrentStatus.REMOVED)
             if hash_value:

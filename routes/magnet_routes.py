@@ -676,7 +676,18 @@ def prepare_manual_assignment():
                     files = []
             
             logging.info(f"Retrieved {len(files)} files for manual assignment. Torrent ID: {torrent_id}, Filename: {torrent_filename}")
-            
+
+        except Exception as _ma_err:
+            # Surface a clear message instead of a bare "internal server error".
+            # Common cases: Torbox 400 BOZO_TORRENT (bad .torrent), provider auth,
+            # or the torrent already failing to add. Log the full trace for debug.
+            logging.error(f"Failed to add torrent / get file list in manual assignment: {_ma_err}", exc_info=True)
+            _hint = ''
+            if 'BOZO_TORRENT' in str(_ma_err) or 'Invalid Torrent' in str(_ma_err):
+                _hint = ' The uploaded file is not a valid .torrent file. If you pasted a magnet link, paste it in the magnet link field (or re-save it as a real .torrent).'
+            return jsonify({'success': False,
+                            'error': f'Failed to add torrent to debrid: {_ma_err}.{_hint}'}), 502
+
         finally:
             # Clean up temporary file if it was created
             if temp_file_path and os.path.exists(temp_file_path):
