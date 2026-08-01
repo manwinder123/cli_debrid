@@ -87,7 +87,16 @@ document.addEventListener('DOMContentLoaded', function() {
         <div class="assignment-grid">
             <div class="assignment-header">Media Item</div>
             <div class="assignment-header">Torrent File</div>
-            
+
+            {# Single shared file list; each item gets a searchable input instead
+               of a <select> with every file as an option (291 episodes x 291
+               files was ~85k DOM elements — this keeps it at 291). #}
+            <datalist id="manual-assign-files">
+                {% for file in video_files %}
+                    <option value="{{ file.filename }}">{{ file.filename }} ({{ (file.bytes / (1024*1024*1024))|round(2) }} GB)</option>
+                {% endfor %}
+            </datalist>
+
             {% for item in target_items %}
             <div class="media-item-info">
                 <strong>{{ item.title }}</strong> ({{ item.year }})
@@ -96,17 +105,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 {% endif %}
             </div>
             <div class="file-selector">
-                <select name="{{ item.item_key }}" class="form-control">
-                    <option value="">-- Select a file --</option>
-                    <option value="--ignore--">-- Ignore this item --</option>
-                    {% for file in video_files %}
-                        {# Use filename (basename) for the option value, display full path for context #}
-                        {# Pre-select based on suggested_file_path (which is now also a basename) matching file.filename #}
-                        <option value="{{ file.filename }}" {% if item.suggested_file_path == file.filename %}selected{% endif %}>
-                            {{ file.filename }} ({{ (file.bytes / (1024*1024*1024))|round(2) }} GB)
-                        </option>
-                    {% endfor %}
-                </select>
+                <input name="{{ item.item_key }}" class="form-control ma-file-picker"
+                       list="manual-assign-files"
+                       value="{{ item.suggested_file_path or '' }}"
+                       placeholder="Type to search a file, or leave blank to skip this item…"
+                       autocomplete="off">
+                <label class="ma-ignore"><input type="checkbox" class="ma-ignore-chk"> Ignore</label>
             </div>
             {% else %}
             <div class="no-items" colspan="2">
@@ -120,5 +124,21 @@ document.addEventListener('DOMContentLoaded', function() {
             <button type="submit" id="confirm-assignment-btn" class="btn btn-primary">Confirm Assignment</button>
         </div>
     </form>
+
+    <script>
+        // Toggling "Ignore" clears + disables the file input so it isn't submitted,
+        // and the confirmation step skips items with no selection.
+        document.querySelectorAll('.ma-ignore-chk').forEach(function (chk) {
+            chk.addEventListener('change', function () {
+                var input = this.closest('.file-selector').querySelector('input[name]');
+                if (input) {
+                    if (this.checked) { input.value = ''; input.disabled = true; }
+                    else { input.disabled = false; }
+                }
+            });
+        });
+        // Pre-clear any leftover stale values scrolled into view isn't needed;
+        // datalist inputs are self-contained.
+    </script>
 </div>
-{% endblock %} 
+{% endblock %}

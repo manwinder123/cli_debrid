@@ -558,6 +558,44 @@ def _fetch_tmdb_seasons_fallback(tmdb_id) -> Optional[dict]:
         return None
 
 
+def _extract_anime_episode_number(filename: str) -> Optional[int]:
+    """Best-effort extraction of a standalone episode number from an anime-style
+    filename PTT can't parse (e.g. 'Dragon.Ball.Z.001.480p...mkv' -> 1).
+
+    Skips resolutions, years, and non-episode numeric tokens, picking the first
+    plausible padded episode number. Used only as a fallback for files with no
+    extracted S/E — the user can always override in the assignment UI.
+    """
+    import re as _re
+    base = os.path.splitext(os.path.basename(filename or ''))[0]
+    _RES = {144, 240, 360, 480, 576, 720, 1080, 1440, 2160, 4320}
+    for tok in _re.findall(r'\d+', base):
+        n = int(tok)
+        if n == 0 or n in _RES or (1900 <= n <= 2100):
+            continue
+        if len(tok) >= 5:   # hash / long numeric run — not an episode
+            continue
+        return n
+    return None
+
+
+def _build_anime_abs_map(metadata: Dict[str, Any]) -> Dict[int, tuple]:
+    """Map series-absolute episode numbers -> (season, episode), built by walking
+    the metadata seasons in airing order (specials excluded). Lets anime files
+    named with a plain episode number ('Dragon.Ball.Z.001...' = absolute ep 1)
+    be matched to their SxxEyy."""
+    abs_map: Dict[int, tuple] = {}
+    seasons = metadata.get('seasons') or {}
+    for s in sorted(seasons.keys(), key=lambda x: int(x)):
+        s_int = int(s)
+        if s_int == 0:
+            continue  # specials (season 0) keep their own naming
+        eps = seasons[s].get('episodes') or {}
+        for e in sorted(int(x) for x in eps.keys()):
+            abs_map[len(abs_map) + 1] = (s_int, int(e))
+    return abs_map
+
+
 @magnet_bp.route('/prepare_manual_assignment', methods=['POST'])
 @admin_required
 def prepare_manual_assignment():
@@ -1038,6 +1076,39 @@ def prepare_manual_assignment():
                  logging.warning(f"[Phase 1] Skipping assignment for unrecognized item type: {item_type} for item key {item.get('item_key')}")
 
         logging.info(f"Phase 1 Complete. Assigned {assignment_count} items based on S/E or Movie logic.")
+
+        # --- Phase 1.5: Anime absolute-episode-number matching ---
+        # Anime / scene releases frequently name files with a plain episode number
+        # ("Dragon.Ball.Z.001.480p...") that PTT cannot turn into S/E. Map those
+        # numbers to episodes via series-absolute position so they auto-suggest.
+        logging.info("Phase 1.5: Attempting anime absolute-episode matching...")
+        _abs_map = _build_anime_abs_map(metadata) if metadata.get('seasons') else {}
+        phase15_assignment_count = 0
+        if _abs_map:
+            for _item in [it for it in target_items
+                          if not it.get('assigned') and it.get('type') == 'episode']:
+                _item_se = (_item.get('season_number'), _item.get('episode_number'))
+                _abs_nums = [n for n, se in _abs_map.items() if se == _item_se]
+                if not _abs_nums:
+                    continue
+                _target_abs = _abs_nums[0]
+                for _finfo in [f for f in parsed_video_files if not f['used']]:
+                    # Only consider files PTT couldn't resolve to S/E
+                    if _finfo['parsed'].get('seasons') or _finfo['parsed'].get('episodes'):
+                        continue
+                    _num = _extract_anime_episode_number(_finfo['original'].get('filename') or '')
+                    if _num == _target_abs:
+                        _item['suggested_file_path'] = _finfo['original'].get('filename')
+                        _item['assigned'] = True
+                        _finfo['used'] = True
+                        phase15_assignment_count += 1
+                        logging.info(
+                            f"[Phase 1.5] Auto-assigned '{_finfo['original'].get('path')}' "
+                            f"to '{_item.get('item_key')}' (absolute ep {_target_abs})"
+                        )
+                        break
+        assignment_count += phase15_assignment_count
+        logging.info(f"Phase 1.5 Complete. Assigned {phase15_assignment_count} items via absolute episode numbers.")
 
         # --- Phase 2: Title Matching Fallback (File-Centric) ---
         logging.info("Phase 2: Attempting Title matching for remaining items...")
