@@ -1275,9 +1275,14 @@ def confirm_manual_assignment():
 
         # Each key in assignments (excluding common data) should be an item_key
         # The value will be a list containing the selected file path
+        # All items share the same show/movie — cache the (re-fetched) metadata
+        # and its TMDB seasons so we fetch them ONCE instead of once per episode
+        # (291 episodes = 291 redundant API calls before this).
+        _ma_metadata_cache: Dict[str, Any] = {}
         for item_key, selected_file_list in assignments.items():
             selected_filename = selected_file_list[0] if selected_file_list else None
-            
+
+
             # Skip if no file was selected for this item
             if not selected_filename or selected_filename == '--ignore--':
                 logging.info(f"Skipping item {item_key} as no file was selected or set to ignore.")
@@ -1290,10 +1295,19 @@ def confirm_manual_assignment():
                 item_type = parts[0]
                 tmdb_id = parts[1]
                 
-                # Re-fetch metadata (can be optimized by caching or passing more data)
+                # Re-fetch metadata (cached per tmdb_id — was once per episode)
                 media_type_lookup = 'movie' if item_type == 'movie' else 'show'
-                from metadata.metadata import get_metadata
-                metadata = get_metadata(tmdb_id=tmdb_id, item_media_type=media_type_lookup)
+                if tmdb_id in _ma_metadata_cache:
+                    metadata = _ma_metadata_cache[tmdb_id]
+                else:
+                    from metadata.metadata import get_metadata
+                    metadata = get_metadata(tmdb_id=tmdb_id, item_media_type=media_type_lookup)
+                    if metadata and media_type_lookup != 'movie' and not metadata.get('seasons'):
+                        # Trakt is often down (403); populate seasons from TMDB once
+                        _ts = _fetch_tmdb_seasons_fallback(str(metadata.get('tmdb_id') or tmdb_id))
+                        if _ts:
+                            metadata['seasons'] = _ts
+                    _ma_metadata_cache[tmdb_id] = metadata
                 if not metadata:
                     logging.warning(f"Could not re-fetch metadata for {item_key}. Trying with dummy IMDb ID...")
                     # Generate a dummy IMDb ID and create minimal metadata
