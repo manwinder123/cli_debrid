@@ -1194,6 +1194,13 @@ def get_keyword(keyword_id):
         # Get keyword details from TMDB
         url = f"https://api.themoviedb.org/3/keyword/{keyword_id}?api_key={tmdb_api_key}"
         response = requests.get(url, timeout=10)
+
+        # A stale/deleted keyword ID (saved in an old adaptive list) is a normal,
+        # expected 404 from TMDB — not a server error. Let the caller fall back to
+        # displaying the raw ID instead of surfacing a 500 for a "not found" case.
+        if response.status_code == 404:
+            return jsonify({'id': keyword_id, 'name': '', 'error': 'Keyword not found'}), 404
+
         response.raise_for_status()
         data = response.json()
 
@@ -1201,7 +1208,7 @@ def get_keyword(keyword_id):
 
     except requests.exceptions.RequestException as e:
         logging.error(f"TMDB keyword API error: {e}")
-        return jsonify({'error': 'Failed to fetch keyword'}), 500
+        return jsonify({'error': 'Failed to fetch keyword'}), 502
     except Exception as e:
         logging.error(f"Get keyword error: {e}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -1550,6 +1557,10 @@ def filter_content():
             provider_or = watch_provider.replace(',', '|')
             params.append(f"with_watch_providers={provider_or}")
             params.append(f"watch_region={watch_region}")
+            # Without this, with_watch_providers matches flatrate (subscription),
+            # buy, OR rent — so picking e.g. Netflix also returns titles that are
+            # merely purchasable/rentable there, not actually on the subscription.
+            params.append("with_watch_monetization_types=flatrate")
         if watch_provider_exclude:
             params.append(f"without_watch_providers={watch_provider_exclude}")
 

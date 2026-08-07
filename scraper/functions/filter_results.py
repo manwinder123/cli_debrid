@@ -1784,17 +1784,21 @@ def filter_results(
             pre_size_filtered_results.append(result.copy()) 
             
             # Size filters
-            if result['size'] > 0:
-                if result['size'] < min_size_gb:
-                    size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
-                    result['filter_reason'] = f"{size_type_msg} too small: {result['size']:.2f} GB (min: {min_size_gb} GB)"
-                    logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB below minimum {min_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
-                    continue
-                if result['size'] > max_size_gb:
-                    size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
-                    result['filter_reason'] = f"Size too large: {result['size']:.2f} GB (max: {max_size_gb} GB)"
-                    logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB above maximum {max_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
-                    continue
+            # result['size'] == 0 means the scraper could not parse a size (e.g. an
+            # AIOStreams/MediaFusion result whose description has no machine-readable
+            # size), not that the release is verified to be empty — it must still be
+            # held to min_size_gb rather than bypassing the check entirely.
+            if result['size'] < min_size_gb:
+                size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
+                reason = "unknown/unparseable" if result['size'] == 0 else f"{result['size']:.2f} GB"
+                result['filter_reason'] = f"{size_type_msg} too small: {reason} (min: {min_size_gb} GB)"
+                logging.info(f"Rejected: {size_type_msg} {reason} below minimum {min_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
+                continue
+            if result['size'] > max_size_gb:
+                size_type_msg = "Average episode size" if is_episode and is_identified_as_pack and num_episodes_in_pack > 0 else "Size"
+                result['filter_reason'] = f"Size too large: {result['size']:.2f} GB (max: {max_size_gb} GB)"
+                logging.info(f"Rejected: {size_type_msg} {result['size']:.2f}GB above maximum {max_size_gb}GB for '{original_title}' (Total pack: {result['total_size_gb']:.2f}GB)")
+                continue
             #logging.debug("✓ Passed size checks")
             
             # Bitrate filters

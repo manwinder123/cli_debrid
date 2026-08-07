@@ -2284,6 +2284,20 @@ function applyAdvancedFilters(closeDrawer = true) {
         return;  // Don't proceed to TMDB API search
     }
 
+    runDiscoverFilterQuery();
+}
+
+/**
+ * Build TMDB discover params from the current filter state and fetch results.
+ * This is the generic (non-list-mode, non-tab-specific) query path shared by
+ * applyAdvancedFilters() and the adaptive-list edit one-time initial load
+ * (see loadAdaptiveListForEdit) — the latter calls this directly to bypass
+ * applyAdvancedFilters()'s deliberate no-fetch-while-editing guard, since an
+ * initial load is a one-time fetch, not a live-tweak reaction.
+ */
+function runDiscoverFilterQuery() {
+    const state = window.discoverState;
+
     // Build sort_by parameter - dropdown values already include order (e.g., "popularity.desc")
     // If sortBy already has the order, use it directly; otherwise combine with sortOrder
     // 'none' is only meaningful for list mode; fall back to popularity for TMDB API
@@ -5257,7 +5271,16 @@ function applyFiltersToUI(filters) {
 
     // Apply filters and update UI
     setTimeout(() => {
-        applyFilters();
+        // Adaptive-list edit/create mode has a deliberate guard (applyAdvancedFilters)
+        // that skips TMDB fetches on every filter tweak while editing, to avoid firing
+        // an API call per click. But loading a saved list for editing needs exactly one
+        // initial fetch so the results grid isn't blank — list-sourced lists (filters.lists)
+        // already get that via loadSavedLists() above, so only pure-filter lists need this.
+        if (window.adaptiveListEditMode && !filters.lists) {
+            runDiscoverFilterQuery();
+        } else {
+            applyFilters();
+        }
         updateActiveFilters();
     }, 100);
 }

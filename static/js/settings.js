@@ -919,6 +919,14 @@ export function updateSettings() {
     } else {
     }
 
+    const enableSeadexPriority = document.getElementById('scraping-enable_seadex_priority');
+
+    if (enableSeadexPriority) {
+        settingsData['Scraping']['enable_seadex_priority'] = enableSeadexPriority.checked;
+
+    } else {
+    }
+
     const syncDeletions = document.getElementById('sync deletions-sync_deletions');
     
     if (syncDeletions) {
@@ -1274,6 +1282,7 @@ function updateContentSourceCheckPeriods() {
         'Trakt Watchlist': 900,
         'Trakt Lists': 900,
         'Trakt Collection': 900,
+        'Special Trakt Lists': 900,
         'My Plex Watchlist': 900,
         'Other Plex Watchlist': 900,
         'My Plex RSS Watchlist': 900,

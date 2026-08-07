@@ -6809,40 +6809,46 @@ class ProgramRunner:
                                             log_successful_upgrade(_notif)
                                         except Exception as _lsu_err:
                                             logging.debug(f"[PlexCheck] log_successful_upgrade failed: {_lsu_err}")
-                                    # Upgrade cleanup: delete old torrent/NZB and remove old Plex entry
+                                    # Upgrade cleanup: delete old torrent/NZB and remove old Plex entry.
+                                    # Gated on Scraping.enable_upgrading_cleanup — when disabled, the old
+                                    # file/torrent must be left in place (same "keep both files" contract
+                                    # as local_library_scan.py's upgrade handling).
                                     _old_torrent_id = _notif.get('upgrading_from_torrent_id')
                                     _upgrading_from_path = _notif.get('upgrading_from')
-                                    if _old_torrent_id:
-                                        if _old_torrent_id.startswith('nzb:'):
-                                            # Old item was an NZB — remove via cli_mount
+                                    if not get_setting("Scraping", "enable_upgrading_cleanup", default=False):
+                                        logging.info(f"[PlexCheck] Scraping.enable_upgrading_cleanup is disabled — keeping old file/torrent for item {item_id} ({item_title_for_log}).")
+                                    else:
+                                        if _old_torrent_id:
+                                            if _old_torrent_id.startswith('nzb:'):
+                                                # Old item was an NZB — remove via cli_mount
+                                                try:
+                                                    from usenet import get_usenet_client as _guc
+                                                    _uc = _guc()
+                                                    if _uc:
+                                                        _uc.remove_nzb(_old_torrent_id[4:], entry_name=_upgrading_from_path or '')
+                                                        logging.info(f"[PlexCheck] Removed old upgrade NZB {_old_torrent_id} for item {item_id} ({item_title_for_log})")
+                                                except Exception as _ct_err:
+                                                    logging.warning(f"[PlexCheck] Failed to remove old upgrade NZB {_old_torrent_id}: {_ct_err}")
+                                            else:
+                                                # Old item was a debrid torrent
+                                                try:
+                                                    from debrid import get_debrid_provider as _gdp
+                                                    _dp = _gdp()
+                                                    if _dp:
+                                                        _dp.remove_torrent(_old_torrent_id, removal_reason='Replaced by upgrade')
+                                                        logging.info(f"[PlexCheck] Removed old upgrade torrent {_old_torrent_id} for item {item_id} ({item_title_for_log})")
+                                                except Exception as _ct_err:
+                                                    if '404' in str(_ct_err):
+                                                        logging.debug(f"[PlexCheck] Old torrent {_old_torrent_id} already removed (404)")
+                                                    else:
+                                                        logging.warning(f"[PlexCheck] Failed to remove old upgrade torrent {_old_torrent_id}: {_ct_err}")
+                                        if _upgrading_from_path:
                                             try:
-                                                from usenet import get_usenet_client as _guc
-                                                _uc = _guc()
-                                                if _uc:
-                                                    _uc.remove_nzb(_old_torrent_id[4:], entry_name=_upgrading_from_path or '')
-                                                    logging.info(f"[PlexCheck] Removed old upgrade NZB {_old_torrent_id} for item {item_id} ({item_title_for_log})")
-                                            except Exception as _ct_err:
-                                                logging.warning(f"[PlexCheck] Failed to remove old upgrade NZB {_old_torrent_id}: {_ct_err}")
-                                        else:
-                                            # Old item was a debrid torrent
-                                            try:
-                                                from debrid import get_debrid_provider as _gdp
-                                                _dp = _gdp()
-                                                if _dp:
-                                                    _dp.remove_torrent(_old_torrent_id, removal_reason='Replaced by upgrade')
-                                                    logging.info(f"[PlexCheck] Removed old upgrade torrent {_old_torrent_id} for item {item_id} ({item_title_for_log})")
-                                            except Exception as _ct_err:
-                                                if '404' in str(_ct_err):
-                                                    logging.debug(f"[PlexCheck] Old torrent {_old_torrent_id} already removed (404)")
-                                                else:
-                                                    logging.warning(f"[PlexCheck] Failed to remove old upgrade torrent {_old_torrent_id}: {_ct_err}")
-                                    if _upgrading_from_path:
-                                        try:
-                                            from utilities.plex_functions import remove_file_from_plex
-                                            remove_file_from_plex(item_title_for_log, _upgrading_from_path)
-                                            logging.info(f"[PlexCheck] Removed old upgrade file from Plex for item {item_id} ({item_title_for_log})")
-                                        except Exception as _cp_err:
-                                            logging.warning(f"[PlexCheck] Failed to remove old upgrade file from Plex for item {item_id}: {_cp_err}")
+                                                from utilities.plex_functions import remove_file_from_plex
+                                                remove_file_from_plex(item_title_for_log, _upgrading_from_path)
+                                                logging.info(f"[PlexCheck] Removed old upgrade file from Plex for item {item_id} ({item_title_for_log})")
+                                            except Exception as _cp_err:
+                                                logging.warning(f"[PlexCheck] Failed to remove old upgrade file from Plex for item {item_id}: {_cp_err}")
                                 # Check if the Plex episode has a local:// guid (episode-level mismatch)
                                 # or the show has no external IDs (show-level mismatch).
                                 # In both cases, use the Plex GUID from battery to fix directly.
@@ -9014,6 +9020,9 @@ class ProgramRunner:
     def task_upgrade_hub_scan(self):
         """Scheduled nightly scan for better-quality releases via Zilean."""
         try:
+            if 'task_upgrade_hub_scan' not in self.enabled_tasks:
+                logging.debug("[UPGRADE_HUB] Scheduled scan skipped — task disabled in Task Manager")
+                return
             from database.zilean_upgrade import scan_for_upgrades, get_scan_status
             from utilities.settings import get_setting
             if get_scan_status()['in_progress']:
@@ -9041,6 +9050,9 @@ class ProgramRunner:
     def task_upgrade_hub_auto_queue(self):
         """Auto-queue upgrade candidates found in the most recent scan."""
         try:
+            if 'task_upgrade_hub_auto_queue' not in self.enabled_tasks:
+                logging.debug("[UPGRADE_HUB] Auto-queue skipped — task disabled in Task Manager")
+                return
             from utilities.settings import get_setting
             from database.zilean_upgrade import (
                 get_last_results, scan_for_upgrades, get_scan_status, queue_upgrade_candidates
