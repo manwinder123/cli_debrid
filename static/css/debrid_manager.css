@@ -1593,6 +1593,19 @@
 .dm-pt-action-btn { white-space: nowrap; }
 .dm-pt-action-ok  { color: #4caf50 !important; border-color: #4caf50 !important; }
 
+/* ── NAS / Network Drive health indicators ──────────────────────────────── */
+.dm-healthy {
+    color: #4caf50;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+.dm-missing {
+    color: #f44336;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
 .dm-pt-col-files {
     min-width: 300px;
 }

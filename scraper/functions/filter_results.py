@@ -736,7 +736,10 @@ def filter_results(
                     logging.info(f"  Weighting: using set similarity only (no parsed title)")
                 # Show simple similarity calculations if they were computed
                 try:
-                    logging.info(f"  Simple similarities - result: {simple_sim_result:.3f}, parsed: {simple_sim_parsed:.3f}, combined: {simple_sim:.3f}")
+                    _sim_r = simple_sim_result if simple_sim_result is not None else 0.0
+                    _sim_p = simple_sim_parsed if simple_sim_parsed is not None else 0.0
+                    _sim_c = simple_sim if simple_sim is not None else 0.0
+                    logging.info(f"  Simple similarities - result: {_sim_r:.3f}, parsed: {_sim_p:.3f}, combined: {_sim_c:.3f}")
                 except NameError:
                     logging.info(f"  Simple similarities - not computed (similarity was high enough)")
                 logging.info(f"  Alias similarities: {alias_similarities}")

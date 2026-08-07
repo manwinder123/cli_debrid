@@ -343,7 +343,7 @@ def create_episode_item(show_item: Dict[str, Any], season_number: int, episode_n
         'imdb_id': show_item['imdb_id'],
         'tmdb_id': show_item['tmdb_id'],
         'title': show_item['title'],
-        'year': show_item['year'],
+        'year': show_item.get('year'),
         'season_number': int(season_number),
         'episode_number': int(episode_number),
         'episode_title': episode_data.get('title', f"Episode {episode_number}"),

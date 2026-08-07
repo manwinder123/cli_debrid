@@ -295,6 +295,19 @@
                         <p class="dm-backup-desc">Automatically removes errored and duplicate torrents from your debrid account on a schedule.</p>
                     </div>
 
+                    <!-- ── BAD SOURCES (always visible, not gated on cli_mount) ── -->
+                    <div class="dm-backup-card" style="margin-bottom:14px">
+                        <div class="dm-backup-card-header">
+                            <span>Bad Sources (unservable)</span>
+                            <span style="display:flex;gap:8px">
+                                <button onclick="_badsrcRefresh()" style="background:#333;border:1px solid #555;color:#eee;border-radius:6px;padding:6px 12px;cursor:pointer">Refresh</button>
+                                <button onclick="_badsrcClear()" style="background:#333;border:1px solid #ff6b6b;color:#ff6b6b;border-radius:6px;padding:6px 12px;cursor:pointer">Clear All</button>
+                            </span>
+                        </div>
+                        <p class="dm-backup-desc">Debrid sources (torrent infohashes) that return no servable link are skipped during re-selection, so cli_debrid matches a different source instead of re-hitting the dead one.</p>
+                        <div id="badsrc-list" style="font-size:12px;color:var(--text-secondary,#888);max-height:200px;overflow:auto;font-family:monospace;white-space:pre-wrap;margin-top:8px">Click Refresh to load.</div>
+                    </div>
+
                     <div class="dm-backup-card">
                         <div class="dm-backup-card-title">Cleanup Rules</div>
                         <div class="dm-cleanup-rules">
@@ -1173,6 +1186,13 @@
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                     Clear Cache
                 </button>
+                <button id="rc-clean-unservable-dry" class="dm-btn dm-btn-secondary" title="Dry-run: detect unservable Collected items (bounded, newest-first) without changing anything.">
+                    Clean Unservable (dry)
+                </button>
+                <button id="rc-clean-unservable-run" class="dm-btn dm-btn-secondary" title="Move unservable Collected items to Wanted + mark source bad, so they re-match to a servable source.">
+                    Clean Unservable
+                </button>
+                <span id="rc-clean-unservable-msg" style="font-size:12px;color:var(--text-secondary,#888);vertical-align:middle"></span>
                 <button id="rc-reload-btn" class="dm-btn dm-btn-secondary">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                     Refresh
@@ -1377,6 +1397,8 @@
             <div id="rc-panel-nas" class="dm-rc-group-panel" style="display:none">
                 <p class="dm-pt-group-desc">Collected items stored on NAS / local storage (not in {{ debrid_provider_name }}). Detected by filesystem path not matching any known debrid mount prefix.</p>
                 <div class="dm-rc-filter-bar">
+                    <button class="dm-btn dm-btn-sm" id="rc-nas-adopt-btn" title="Run the NAS Source Adoption job now — replaces collected debrid symlinks with verified NAS copies (see Settings → NAS Source Adoption)" onclick="_runNasAdopt()">Adopt NAS sources now</button>
+                    <span id="rc-nas-adopt-msg" style="margin-left:8px;font-size:0.82rem;color:#9ca3af"></span>
                     <input type="text" class="dm-rc-search" placeholder="Search…" oninput="_rcFilterTable(this)">
                     <select class="dm-rc-type-filter" onchange="_rcFilterTable(this)">
                         <option value="">All types</option>
@@ -1388,10 +1410,11 @@
                     <thead><tr>
                         <th class="dm-rc-th-sort" data-sort="title">Title</th>
                         <th class="dm-pt-col-type dm-rc-th-sort" data-sort="type">Type</th>
+                        <th class="dm-rc-col-file dm-rc-th-sort" data-sort="file_exists">Status</th>
                         <th class="dm-rc-col-file dm-rc-th-sort" data-sort="filled_by_file">File</th>
                         <th class="dm-col-actions">Actions</th>
                     </tr></thead>
-                    <tbody id="rc-tbody-nas"><tr class="dm-empty-row"><td colspan="4">Loading…</td></tr></tbody>
+                    <tbody id="rc-tbody-nas"><tr class="dm-empty-row"><td colspan="5">Loading…</td></tr></tbody>
                 </table></div>
             </div>
 
@@ -1662,6 +1685,21 @@
                                 </button>
                                 <span id="bta-error-msg" class="bta-error-msg" style="display:none"></span>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bad Sources registry (unservable debrid sources, skipped on re-match) -->
+                <div id="bta-badsources-card" class="bta-card" style="margin-bottom:16px">
+                    <div class="bta-card-hdr">
+                        <span class="bta-card-title">Bad Sources <span class="bta-tag bta-tag-broken">unservable</span></span>
+                        <button class="bta-btn bta-btn-secondary" onclick="_btaBadSourcesLoad()">Refresh</button>
+                        <button class="bta-btn" onclick="_btaBadSourcesClear()" style="background:#333;color:#ff6b6b">Clear All</button>
+                    </div>
+                    <div class="bta-card-body">
+                        <p class="bta-desc">Debrid sources (torrent infohashes) that return no servable link are skipped during re-selection, so cli_debrid matches a different source instead of re-hitting the dead one.</p>
+                        <div id="bta-bs-list" style="font-size:12px;color:var(--text-secondary,#888);max-height:240px;overflow:auto;font-family:monospace;white-space:pre-wrap">
+                            <span class="bta-desc">Not loaded — click Refresh.</span>
                         </div>
                     </div>
                 </div>
@@ -6634,20 +6672,52 @@ function _rcRenderUntracked(items) {
 
 function _rcRenderNas(items) {
     const tbody = document.getElementById('rc-tbody-nas');
-    if (!items.length) { tbody.innerHTML = '<tr class="dm-empty-row"><td colspan="4">No NAS items found.</td></tr>'; return; }
-    tbody.innerHTML = items.map(item => `<tr>
+    if (!items.length) { tbody.innerHTML = '<tr class="dm-empty-row"><td colspan="5">No NAS items found.</td></tr>'; return; }
+    tbody.innerHTML = items.map(item => {
+        const healthIcon = item.file_exists
+            ? '<span class="dm-healthy" title="File exists on disk">&#10003; Healthy</span>'
+            : '<span class="dm-missing" title="File not found on disk">&#10007; Missing</span>';
+        return `<tr>
         <td>${_rcTitleCell(item)}</td>
         <td>${_rcTypeBadge(item.type)}</td>
+        <td class="dm-rc-col-file">${healthIcon}</td>
         <td class="dm-rc-col-file" style="max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="dm-pt-folder" title="${escHtml(item.location_on_disk||item.filled_by_file||'')}">${escHtml(item.location_on_disk||item.filled_by_file||'—')}</span></td>
         <td class="dm-col-actions" style="white-space:nowrap">
             <button class="dm-btn dm-btn-danger dm-btn-sm dm-rc-del-db-btn" data-id="${escHtml(String(item.id))}" title="Delete from database">Delete</button>
         </td>
-    </tr>`).join('');
+    </tr>`}).join('');
     _rcBindActions(tbody);
     tbody.closest('table').querySelectorAll('.dm-rc-th-sort').forEach(th => {
         th.style.cursor = 'pointer';
         th.onclick = () => _rcSortBy('nas', th.dataset.sort, th);
     });
+}
+
+async function _runNasAdopt() {
+    const btn = document.getElementById('rc-nas-adopt-btn');
+    const msg = document.getElementById('rc-nas-adopt-msg');
+    const setMsg = (t) => { if (msg) msg.textContent = t; };
+    if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+    setMsg('');
+    try {
+        const r = await fetch('/debrid_manager/api/nas_adopt/run', {method: 'POST'});
+        const data = await r.json();
+        if (!data.success) throw new Error(data.error || 'Failed to run');
+        if (data.skipped_reason) { setMsg('Skipped: ' + data.skipped_reason); }
+        else {
+            let parts = [`Adopted ${data.adopted}`];
+            if (data.skipped_no_nas) parts.push(`${data.skipped_no_nas} no NAS copy`);
+            if (data.skipped_not_in_plex) parts.push(`${data.skipped_not_in_plex} not in Plex`);
+            if (data.skipped_category) parts.push(`${data.skipped_category} category-disabled`);
+            if (data.errors) parts.push(`${data.errors} errors`);
+            setMsg(parts.join(' · '));
+        }
+        loadReconcile(true);
+    } catch(e) {
+        setMsg('Failed: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Adopt NAS sources now'; }
+    }
 }
 
 function _rcGetIds(btn) {
@@ -6965,6 +7035,28 @@ document.getElementById('rc-clear-cache-btn')?.addEventListener('click', async f
         setTimeout(() => { this.innerHTML = orig; this.disabled = false; loadReconcile(true); }, 800);
     } catch(e) { this.innerHTML = orig; this.disabled = false; }
 });
+
+// ── Clean Unservable (symlink health sweep, DB-consistent) ────────────────
+async function _cleanUnservable(ev, dry) {
+    const msgEl = document.getElementById('rc-clean-unservable-msg');
+    if (msgEl) msgEl.textContent = 'Running…';
+    try {
+        const r = await fetch('/debrid_manager/api/reconcile/clean_unservable', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({dry_run: !!dry}),
+        });
+        const d = await r.json();
+        if (msgEl) {
+            if (!d.success) msgEl.textContent = 'Error: ' + (d.error || 'failed');
+            else if (dry) msgEl.textContent = `[dry] ${d.found_bad} unservable found (probed ${d.max_probe}, cap ${d.max_items})`;
+            else msgEl.textContent = `requeued ${d.moved} to Wanted, marked ${d.bad_marked} bad, removed ${d.removed_links} symlinks`;
+        }
+        if (dry && window._rcLoaded === true) setTimeout(function(){ loadReconcile(true); }, 1500);
+    } catch(e) { if (msgEl) msgEl.textContent = 'Error: ' + e; }
+}
+document.getElementById('rc-clean-unservable-dry')?.addEventListener('click', (e) => _cleanUnservable(e, true));
+document.getElementById('rc-clean-unservable-run')?.addEventListener('click', (e) => _cleanUnservable(e, false));
+
 if (_dmActiveTab === 'reconcile') { loadReconcile(false); loadBatteryAudit(false); if (typeof _slInitAudit === 'function') _slInitAudit(); }
 
 // ── INIT ───────────────────────────────────────────────────────────────────
@@ -8156,6 +8248,61 @@ _battEl('batt-reid-commit-btn')?.addEventListener('click', async function() {
             }
         } catch(e) { setTimeout(_ataPoll, 2000); }
     }
+
+    // --- Bad Sources registry (Maintenance-tab, always visible) ---
+    window._badsrcRefresh = async function () {
+        const el = document.getElementById('badsrc-list');
+        if (!el) return;
+        el.textContent = 'Loading…';
+        try {
+            const r = await fetch('/debrid_manager/api/bad_sources', {method: 'GET'});
+            const d = await r.json();
+            if (!d.success) { el.textContent = 'Error: ' + (d.error || 'failed'); return; }
+            const bs = d.bad_sources || {};
+            const keys = Object.keys(bs);
+            el.textContent = keys.length ? (keys.length + ' bad source(s):\n' + keys.map(h => h + '  (' + bs[h] + ')').join('\n')) : '(empty — no unservable sources registered)';
+        } catch (e) { el.textContent = 'Error: ' + e; }
+    };
+    window._badsrcClear = async function () {
+        if (!window.confirm('Clear the entire bad-sources list? They will be re-tried on next scrape.')) return;
+        try {
+            const r = await fetch('/debrid_manager/api/bad_sources/clear', {method: 'POST', headers: {'Content-Type': 'application/json'}});
+            const d = await r.json();
+            const el = document.getElementById('badsrc-list');
+            if (el) el.textContent = d.message || 'Cleared.';
+        } catch (e) { const el = document.getElementById('badsrc-list'); if (el) el.textContent = 'Error: ' + e; }
+    };
+
+    // --- Bad Sources registry (view / clear) ---
+    window._btaBadSourcesLoad = async function () {
+        const el = _bta('bta-bs-list');
+        if (!el) return;
+        el.textContent = 'Loading…';
+        try {
+            const r = await fetch('/debrid_manager/api/bad_sources', {method: 'GET'});
+            const d = await r.json();
+            if (!d.success) { el.textContent = 'Error: ' + (d.error || 'failed'); return; }
+            const bs = d.bad_sources || {};
+            const keys = Object.keys(bs);
+            if (!keys.length) { el.textContent = '(empty — no unservable sources registered)'; return; }
+            el.textContent = (keys.length + ' bad source(s):\n' + keys.map(h => h + '  (' + bs[h] + ')').join('\n'));
+        } catch (e) {
+            el.textContent = 'Error: ' + e;
+        }
+    };
+
+    window._btaBadSourcesClear = async function () {
+        if (!window.confirm('Clear the entire bad-sources list? They will be re-tried on next scrape.')) return;
+        try {
+            const r = await fetch('/debrid_manager/api/bad_sources/clear', {method: 'POST', headers: {'Content-Type': 'application/json'}});
+            const d = await r.json();
+            const el = _bta('bta-bs-list');
+            if (el) el.textContent = d.message || 'Cleared.';
+        } catch (e) {
+            const el = _bta('bta-bs-list');
+            if (el) el.textContent = 'Error: ' + e;
+        }
+    };
 
     window._btaStartScan = async function (fresh) {
         _btaActiveSource = 'bad';

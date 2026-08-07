@@ -958,6 +958,14 @@ def fetch_items_from_trakt(
                 )
                 return []
 
+            elif status_code == 403:  # Forbidden — persistent auth/block, retrying won't help
+                logging.warning(
+                    f"Trakt API returned 403 Forbidden for {url}. This is a persistent issue — "
+                    f"check the Trakt client ID / API key and that Trakt isn't blocking this client. "
+                    f"Skipping."
+                )
+                return []
+
             elif status_code in (502, 504):  # Temporary gateway issues
                 delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
                 logging.warning(

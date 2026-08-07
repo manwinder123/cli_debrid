@@ -742,19 +742,69 @@ class MediaMatcher:
         """
         item_type = item.get('type')
 
-        # --- Movie Logic (Find largest video file) ---
+        # --- Movie Logic (title-verified largest video file) ---
         if item_type == 'movie':
-            video_files = []
-            for parsed_file in parsed_files:
-                 # _parse_file_info already filtered non-video/samples
-                 video_files.append(parsed_file)
+            # Build the set of titles to match the candidate against.
+            item_titles = []
+            for key in ('title', 'original_title', 'name', 'clean_title'):
+                v = item.get(key)
+                if v:
+                    item_titles.append(str(v))
+            item_year = item.get('year')
+            if item_year and item.get('title'):
+                item_titles.append(f"{item['title']} {item_year}")
 
-            if not video_files:
+            # Normalized similarity between a release/file name and the wanted title:
+            # max(word-overlap, fuzzy-partial) so both spaced and run-together names work.
+            def _title_sim(release_name: str, title: str) -> float:
+                r = release_name.lower()
+                t = title.lower()
+                wr = set(re.findall(r'[a-z0-9]+', r))
+                wt = set(re.findall(r'[a-z0-9]+', t))
+                word_ov = 0.0
+                if wr and wt:
+                    word_ov = len(wr & wt) / max(len(wr), len(wt))
+                fuzzy = fuzz.partial_ratio(r, t) / 100.0
+                return max(word_ov, fuzzy)
+
+            # Floor: skip tiny promo/sample files (< 20 MB). The size/turnover
+            # guard in create_symlink is a second line of defence.
+            MIN_MOVIE_BYTES = 20 * 1024 * 1024
+            scored = []
+            for pf in parsed_files:
+                if pf.get('bytes', 0) < MIN_MOVIE_BYTES:
+                    continue
+                orig = (pf.get('parsed_info', {}) or {}).get('original_filename', '') \
+                       or os.path.basename(pf.get('path', ''))
+                best = max((_title_sim(orig, t) for t in item_titles), default=0.0)
+                scored.append((best, pf))
+
+            if not scored:
+                logging.warning(
+                    f"[MATCH-GUARD] No movie candidate above size floor for "
+                    f"'{item_titles or item.get('title')}' — nothing to link."
+                )
                 return None
 
-            # Sort by size descending and take the largest
-            largest_file_info = max(video_files, key=lambda x: x.get('bytes', 0))
-            return (os.path.basename(largest_file_info['path']), item) # Return basename path and item
+            # If the best title match is very weak, refuse to link likely-WRONG
+            # content (e.g. The Matrix Reloaded picked for "Cold Storage"). This is
+            # the core fix for the mislinked-movie problem.
+            best_score = max(s for s, _ in scored)
+            if best_score < 0.2:
+                logging.warning(
+                    f"[MATCH-GUARD] Refusing movie match for '{item_titles or item.get('title')}': "
+                    f"best source-name similarity {best_score:.2f} < 0.2 "
+                    f"({os.path.basename(parsed_files[0].get('path',''))}). Item will be re-matched / reviewed."
+                )
+                return None
+
+            # Among candidates that actually match the title band, prefer the largest
+            # (= better bitrate). Size is a tiebreaker here, not the primary selector.
+            band = [pf for s, pf in scored if s >= max(best_score - 0.05, 0.2)]
+            if not band:
+                band = [pf for _, pf in scored]
+            largest = max(band, key=lambda x: x.get('bytes', 0))
+            return (os.path.basename(largest['path']), item)
 
         # --- TV Episode Logic ---
         elif item_type == 'episode':

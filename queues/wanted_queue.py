@@ -2,12 +2,14 @@ import logging
 from datetime import datetime, timedelta, date, time as dt_time
 from typing import Dict, Any, List
 import time
+import os
 
 from utilities.settings import get_setting
 from database.manual_blacklist import is_blacklisted
 from database.core import get_db_connection
 from database.database_reading import get_all_media_items, check_existing_media_item
 from database.database_writing import update_media_item_state, update_blacklisted_date, remove_from_media_items
+from utilities.local_library_scan import check_local_file_in_nas_paths
 
 # Define constants for queue size limits
 SCRAPING_QUEUE_MAX_SIZE = 500
@@ -138,6 +140,31 @@ class WantedQueue:
                 logging.info(f"Item ID {item_id} (Version: {item.get('version')}) already exists in Collected/Upgrading state. Removing duplicate from Wanted.")
                 remove_from_media_items(item_id)
                 return {'status': 'reconciled', 'item_data': item, 'message': f"Reconciled and removed {item_identifier}"}
+
+            # Check 1b: NAS / Network Drive — if a local copy exists in a configured
+            # NAS path, skip scraping entirely and mark the item as Collected.
+            # This prevents unnecessary rescrapes for media that already has a local
+            # transcoded copy (e.g. from Tdarr) in a NAS / Network Drive path.
+            _nas_file = check_local_file_in_nas_paths(item)
+            if _nas_file:
+                logging.info(
+                    f"[{item_identifier}] Local file found in NAS path: "
+                    f"{_nas_file['path']} ({_nas_file['size_gb']} GB). "
+                    f"Skipping scrape, marking as Collected."
+                )
+                # Update location_on_disk to point to the NAS file and record the
+                # real filename so downstream flows (reconcile, Plex cleanup)
+                # know the item's actual file.
+                from database.database_writing import update_media_item
+                update_media_item(
+                    item['id'],
+                    location_on_disk=_nas_file['path'],
+                    filled_by_file=os.path.basename(_nas_file['path']),
+                    state='Collected',
+                )
+                self.remove_item(item)
+                return {'status': 'reconciled', 'item_data': item,
+                        'message': f"NAS file found: {_nas_file['path']}"}
 
             is_magnet_assigned = item.get('content_source') == 'Magnet_Assigner'
             version = item.get('version')

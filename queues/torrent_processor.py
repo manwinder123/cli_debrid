@@ -929,6 +929,21 @@ class TorrentProcessor:
                 if not original_link:
                     continue
 
+                # Skip sources already known to be unservable (RD empty-link /
+                # removed torrent), so re-scraping picks a different, servable
+                # source for the same item instead of re-hitting the bad one.
+                try:
+                    from database.bad_sources import is_bad_source as _is_bad_src
+                    _result_hash = str(result.get('info_hash') or result.get('hash') or '').lower()
+                    if _result_hash and _is_bad_src(_result_hash):
+                        logging.info(
+                            f"[{item_identifier}] [Result {idx}/{len(results)}] Skipping known-bad "
+                            f"source {_result_hash} ({result.get('title', 'Unknown title')}); trying next candidate."
+                        )
+                        continue
+                except Exception as _be:
+                    logging.debug(f"[{item_identifier}] bad-source check skipped: {_be}")
+
                 result_title = result.get('title', 'Unknown title')
                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Processing: {result_title}")
                 logging.debug(f"[{item_identifier}] [Result {idx}/{len(results)}] Raw result data: {result}")

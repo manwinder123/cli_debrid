@@ -178,6 +178,10 @@
                                 data-section="{{ section }}" data-key="{{ key }}"
                                 {% if value.min is defined %}min="{{ value.min }}"{% endif %}
                                 step="0.1">
+                    {% elif value.type == 'string' and value.validate == 'time' %}
+                        <input type="time" id="additional-{{ key }}" name="{{ section }}.{{ key }}"
+                               value="{{ settings.get(section, {}).get(key, '00:00') }}" class="settings-input"
+                               data-section="{{ section }}" data-key="{{ key }}">
                     {% else %}
                         <input type="{% if value.sensitive or (section == 'TMDB' and key == 'api_key' and environment_mode != 'full') %}password{% else %}{{ value.type }}{% endif %}" id="additional-{{ key }}" name="{{ section }}.{{ key }}"
                                value="{{ settings.get(section, {}).get(key, '') }}" class="settings-input"

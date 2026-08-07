@@ -2559,6 +2559,7 @@ def api_reconcile():
         import re as _re
         from utilities.settings import get_setting
         from database.core import get_db_connection
+        from utilities.local_library_scan import check_local_file_in_nas_paths, get_nas_file_index
 
         force = request.args.get('force') == '1'
 
@@ -2724,13 +2725,16 @@ def api_reconcile():
                                  for sid, mt in _sections}
                         for _f in as_completed(_futs):
                             try:
-                                for _kind, _name in _f.result():
+                                for _kind, _name in _f.result(timeout=120):
                                     if _kind == 'f':
                                         plex_file_set.add(_name)
                                     elif _kind == 'd':
                                         plex_folder_set.add(_name)
                                     elif _kind == 'rk':
                                         plex_rating_keys.add(_name)
+                            except TimeoutError:
+                                _sid = _futs.get(_f, '?')
+                                logging.warning(f"[Reconcile] Plex section {_sid} timed out after 120s")
                             except Exception as _pe:
                                 logging.warning(f"[Reconcile] Plex section fetch error: {_pe}")
                     plex_total = len(plex_file_set)
@@ -2746,6 +2750,7 @@ def api_reconcile():
         try:
             db_rows = conn.execute("""
                 SELECT id, title, year, type, imdb_id,
+                       season_number, episode_number,
                        filled_by_file, filled_by_torrent_id,
                        filled_by_magnet, ms_item_id, location_on_disk
                 FROM media_items
@@ -2896,12 +2901,21 @@ def api_reconcile():
         from utilities.settings import get_nas_paths
         _configured_nas_paths = get_nas_paths()
 
+        # Build the NAS file index ONCE for this run — every item is matched
+        # against it in memory instead of re-walking the NAS tree per candidate.
+        _nas_index = None
+        if _configured_nas_paths:
+            _nas_index = get_nas_file_index(_configured_nas_paths, force_refresh=force)
+
         not_in_plex  = []
         torrent_gone = []
         lost         = []
         nas_items    = []
         healthy_count = 0
         nas_count     = 0
+        # Items rescued from "lost"/"torrent gone" by a matching NAS copy — logged
+        # as a summary after the loop so the user can see what the NAS check found.
+        _nas_rescued = []
 
         for row in db_rows:
             tid     = row['filled_by_torrent_id']
@@ -2929,6 +2943,21 @@ def api_reconcile():
                 # In symlink mode: healthy = in Plex + symlink exists + target is in rclone mount.
                 # os.readlink() reads the link value without dereferencing (no rclone network hit).
                 _loc = row['location_on_disk'] or ''
+                # NAS / non-RD storage — mirror the RD-mode detection so NAS items
+                # surface in the NAS tab (Healthy/Missing) in symlink mode too.
+                # Items whose location_on_disk is under a configured NAS path are
+                # listed rather than run through the symlink healthy/lost logic.
+                if _configured_nas_paths:
+                    is_nas = any(_loc.startswith(p) for p in _configured_nas_paths)
+                else:
+                    _item_root = _loc.lstrip('/').split('/')[0]
+                    is_nas = bool(rd_mount_prefixes and _item_root and _item_root not in rd_mount_prefixes)
+                if is_nas:
+                    nas_count += 1
+                    _nas_item = _row_dict(row)
+                    _nas_item['file_exists'] = _os.path.exists(_loc)
+                    nas_items.append(_nas_item)
+                    continue
                 try:
                     _symlink_ok = bool(
                         _loc
@@ -2940,10 +2969,35 @@ def api_reconcile():
                 if in_plex and _symlink_ok:
                     healthy_count += 1
                 elif in_plex and not _symlink_ok:
+                    # Symlink broken — check if a local copy exists in NAS paths
+                    if _configured_nas_paths:
+                        _nas_file = check_local_file_in_nas_paths(dict(row), nas_index=_nas_index)
+                        if _nas_file:
+                            healthy_count += 1
+                            _nas_rescued.append({'id': row['id'], 'title': row['title'] or '',
+                                                 'path': _nas_file['path']})
+                            logging.info(
+                                f"[Reconcile] Item {row['id']} ({row['title'] or ''}) "
+                                f"symlink broken but found in NAS path: {_nas_file['path']}"
+                            )
+                            continue
                     torrent_gone.append(_row_dict(row))   # symlink broken / missing
                 elif _symlink_ok and not in_plex:
                     not_in_plex.append(_row_dict(row))
-                # else: no symlink and not in Plex — skip (item may not be collected yet)
+                else:
+                    # No symlink and not in Plex — check if a local copy exists in NAS paths
+                    if _configured_nas_paths:
+                        _nas_file = check_local_file_in_nas_paths(dict(row), nas_index=_nas_index)
+                        if _nas_file:
+                            healthy_count += 1
+                            _nas_rescued.append({'id': row['id'], 'title': row['title'] or '',
+                                                 'path': _nas_file['path']})
+                            logging.info(
+                                f"[Reconcile] Item {row['id']} ({row['title'] or ''}) "
+                                f"no symlink but found in NAS path: {_nas_file['path']}"
+                            )
+                            continue
+                    # else: item may not be collected yet — skip
             else:
                 # RD mode: healthy = torrent still in RD + in Plex
 
@@ -2983,7 +3037,9 @@ def api_reconcile():
                     is_nas = bool(rd_mount_prefixes and _item_root and _item_root not in rd_mount_prefixes)
                 if is_nas:
                     nas_count += 1
-                    nas_items.append(_row_dict(row))
+                    _nas_item = _row_dict(row)
+                    _nas_item['file_exists'] = _os.path.exists(_loc)
+                    nas_items.append(_nas_item)
                 # has_rd_evidence: torrent ID, magnet hash, or filename — any one is
                 # sufficient. is_nas guards against NAS/local items that coincidentally
                 # have the same filename as an RD torrent.
@@ -2999,7 +3055,31 @@ def api_reconcile():
                 elif not in_rd and in_plex and was_ever_rd:
                     torrent_gone.append(_row_dict(row))
                 elif not in_rd and not in_plex and has_rd_evidence:
+                    # Before declaring "lost", check if a local copy exists in
+                    # configured NAS / Network Drive paths (e.g. Tdarr-transcoded files).
+                    if _configured_nas_paths:
+                        _nas_file = check_local_file_in_nas_paths(dict(row), nas_index=_nas_index)
+                        if _nas_file:
+                            healthy_count += 1
+                            _nas_rescued.append({'id': row['id'], 'title': row['title'] or '',
+                                                 'path': _nas_file['path']})
+                            logging.info(
+                                f"[Reconcile] Item {row['id']} ({row['title'] or ''}) "
+                                f"found in NAS path: {_nas_file['path']}"
+                            )
+                            continue  # skip adding to 'lost'
                     lost.append(_row_dict(row))
+
+        # Summarise the items rescued by NAS local copies — these would otherwise
+        # be reported as lost / torrent-gone and unnecessarily rescraped.
+        if _nas_rescued:
+            _nas_rescued.sort(key=lambda r: (r['title'] or '').lower())
+            _lines = '; '.join(f"{r['title']} (id={r['id']}) -> {r['path']}" for r in _nas_rescued)
+            logging.info(
+                f"[Reconcile] {len(_nas_rescued)} item(s) rescued by NAS local copies: {_lines}"
+            )
+        elif _configured_nas_paths:
+            logging.info("[Reconcile] No items rescued by NAS local copies this run.")
 
         # Deduplicate torrent_gone by filled_by_torrent_id — season packs produce many
         # DB rows per torrent; collapse them to one representative row with affected_count.
@@ -3192,6 +3272,23 @@ def api_clear_cache():
         logging.warning(f'[LibCache] Could not clear rd_library_cache table: {e}')
     logging.info('[LibCache] Cache cleared manually via Debrid Manager')
     return jsonify({'success': True})
+
+
+@debrid_manager_bp.route('/api/nas_adopt/run', methods=['POST'])
+@admin_required
+def api_nas_adopt_run():
+    """Manually run the NAS Source Adoption job (force — bypasses the nightly latch).
+
+    Replaces collected debrid symlinks with verified NAS copies per the
+    NAS Source Adoption settings. Returns the job summary.
+    """
+    try:
+        from utilities.nas_source_adoption import run_nas_source_adoption
+        summary = run_nas_source_adoption(force=True)
+        return jsonify({'success': True, **summary})
+    except Exception as e:
+        logging.error(f"[NAS_Adopt] Manual run failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @debrid_manager_bp.route('/api/reconcile/bulk_requeue', methods=['POST'])
@@ -5801,3 +5898,186 @@ def debrid_delete_all_broken():
     except Exception as e:
         logging.error(f'[DebridRepair] delete_all_broken error: {e}', exc_info=True)
         return jsonify(success=False, error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Bad sources registry — unservable debrid sources skipped during re-selection
+# ---------------------------------------------------------------------------
+
+@debrid_manager_bp.route('/api/bad_sources', methods=['GET'])
+@admin_required
+def api_bad_sources_list():
+    """Return the current bad-source registry (infohash -> reason)."""
+    try:
+        from database.bad_sources import get_bad_sources
+        return jsonify({'success': True, 'bad_sources': get_bad_sources()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@debrid_manager_bp.route('/api/bad_sources/clear', methods=['POST'])
+@admin_required
+def api_bad_sources_clear():
+    """Clear the entire bad-source registry (allows re-trying previously-bad sources)."""
+    try:
+        from database.bad_sources import clear_bad_sources
+        clear_bad_sources()
+        return jsonify({'success': True, 'message': 'Bad sources cleared'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@debrid_manager_bp.route('/api/bad_sources/add', methods=['POST'])
+@admin_required
+def api_bad_sources_add():
+    """Manually register infohashes as unservable so re-selection skips them."""
+    try:
+        from database.bad_sources import mark_bad_source
+        req = request.get_json(silent=True) or {}
+        hashes = req.get('hashes') or []
+        if isinstance(hashes, str):
+            hashes = [hashes]
+        added = 0
+        for h in hashes:
+            if str(h).strip():
+                mark_bad_source(str(h).strip(), 'manual')
+                added += 1
+        return jsonify({'success': True, 'added': added})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@debrid_manager_bp.route('/api/reconcile/clean_unservable', methods=['POST'])
+@admin_required
+def api_clean_unservable():
+    """DB-consistent home for the symlink health sweep.
+
+    For each Collected item whose source symlink is missing OR unreadable
+    (decypharr can't serve it → empty_link / stalled), this:
+      1) moves the item back to Wanted (clears filled_by_* so it re-scrapes),
+      2) registers the source infohash as bad (matcher will skip it on re-scrape),
+      3) removes the source symlink (symlink_watch mirrors the staging-tree copy away).
+    This keeps cli_debrid's DB consistent instead of a third-party script deleting
+    symlinks out-of-band.
+    """
+    try:
+        import subprocess as _sub, os as _os, re as _re
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        req = request.get_json(silent=True) or {}
+        # Request params override env; env overrides built-in defaults.
+        max_items = int(req.get('max_items', 0)) or int(_os.environ.get('CLEAN_UNSERVABLE_MAX_ITEMS', '200'))
+        max_probe = int(req.get('max_probe', 0)) or int(_os.environ.get('CLEAN_UNSERVABLE_MAX_PROBE', '400'))
+        probe_timeout = float(req.get('timeout', 0.0)) or float(_os.environ.get('CLEAN_UNSERVABLE_TIMEOUT', '8'))
+        dry_run = bool(req.get('dry_run', False))
+
+        from database.core import get_db_connection
+        from database.bad_sources import mark_bad_source as _mbs, is_bad_source as _ibs
+
+        # Bound + newest-first (id DESC) so this returns quickly instead of
+        # serially probing the entire library.
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, location_on_disk, filled_by_torrent_id FROM media_items "
+            "WHERE state='Collected' AND location_on_disk IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?", (max_probe,)
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        def _servable(p):
+            if not _os.path.lexists(p):
+                return False
+            try:
+                if _os.stat(p).st_size <= 1_048_576:
+                    return False
+            except OSError:
+                return False
+            try:
+                r = _sub.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", p],
+                    capture_output=True, text=True, timeout=probe_timeout,
+                )
+                try:
+                    return float((r.stdout or "").strip()) > 0
+                except ValueError:
+                    return False
+            except Exception:
+                return False
+
+        cands = [r for r in rows if r[1]]
+        unservable = []
+        if cands:
+            with ThreadPoolExecutor(max_workers=min(8, len(cands))) as ex:
+                fut = {ex.submit(_servable, r[1]): r for r in cands}
+                for fd in as_completed(fut):
+                    try:
+                        ok = fd.result()
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        unservable.append(fut[fd])
+        unservable = unservable[:max_items]
+        found_bad = len(unservable)
+
+        def _hash_from_path(p):
+            m = _re.search(r"([0-9a-f]{40})", p or "")
+            return m.group(1) if m else ""
+
+        moved = 0
+        bad_marked = 0
+        removed_links = 0
+        if not dry_run:
+            for rid, loc, tb in unservable:
+                h = _hash_from_path(loc)
+                # Resolve infohash from the provider by torrent id if not in the path.
+                if not h and tb:
+                    try:
+                        from debrid import get_debrid_provider as _gdp
+                        _info = _gdp().get_torrent_info(tb)
+                        h = _info.get('hash') if _info else ''
+                    except Exception:
+                        h = ""
+                if h and not _ibs(h):
+                    try:
+                        _mbs(h, 'unservable_sweep')
+                        bad_marked += 1
+                    except Exception:
+                        pass
+                # Remove the source symlink (safely; only symlinks/files).
+                try:
+                    if _os.path.islink(loc) or _os.path.isfile(loc):
+                        _os.unlink(loc)
+                        removed_links += 1
+                except OSError:
+                    pass
+                # Move back to Wanted (DB-consistent re-selection).
+                try:
+                    c = get_db_connection()
+                    c2 = c.cursor()
+                    c2.execute(
+                        "UPDATE media_items SET state='Wanted', filled_by_torrent_id=NULL,"
+                        " filled_by_magnet=NULL, filled_by_file=NULL, filled_by_title=NULL,"
+                        " scrape_results=NULL WHERE id=? AND state='Collected'",
+                        (rid,),
+                    )
+                    c.commit()
+                    c.close()
+                    moved += 1
+                except Exception:
+                    pass
+
+        return jsonify({
+            'success': True,
+            'found_bad': found_bad,
+            'moved': moved,
+            'removed_links': removed_links,
+            'bad_marked': bad_marked,
+            'dry_run': dry_run,
+            'max_probe': max_probe,
+            'max_items': max_items,
+        })
+    except Exception as e:
+        logging.error(f"[clean_unservable] error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500

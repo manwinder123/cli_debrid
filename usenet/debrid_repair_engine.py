@@ -936,6 +936,16 @@ def delete_all_broken() -> dict:
             entry_name = entry.get('entry_name') or entry.get('name') or ''
             info_hash = entry.get('info_hash') or entry.get('hash') or ''
 
+            # Register this broken/unservable source (RD empty-link / removed
+            # torrent) so re-scraping skips it and picks a different, servable
+            # source for the same item instead of re-hitting the bad one.
+            try:
+                from database.bad_sources import mark_bad_source as _mbs
+                if info_hash:
+                    _mbs(info_hash, 'broken/unservable')
+            except Exception as _mbe:
+                logger.debug(f'[DebridRepair] mark_bad_source skipped: {_mbe}')
+
             if _delete_from_climount(info_hash, entry_name):
                 deleted_climount += 1
 

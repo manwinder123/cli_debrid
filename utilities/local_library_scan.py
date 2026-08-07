@@ -2,12 +2,13 @@ import logging
 from typing import List, Dict, Any, Optional, Callable
 import os
 import sys  # Import sys module
-from utilities.settings import get_setting
+from utilities.settings import get_setting, get_nas_paths
 import shutil
 from pathlib import Path
 import re
 from datetime import datetime
 import time
+import threading
 from utilities.anidb_functions import format_filename_with_anidb
 from database.database_writing import update_media_item_state, update_media_item
 from utilities.post_processing import handle_state_change
@@ -956,7 +957,29 @@ def create_symlink(source_path: str, dest_path: str, media_item_id: int = None, 
     if not os.path.exists(source_path):
         logging.error(f"Source path does not exist: {source_path}")
         return False
-        
+
+    # --- MATCH-GUARD: refuse obviously-wrong / non-media sources -----------------
+    # Torrents commonly carry a tiny promo/junk file (e.g. "RARBG.com.mp4",
+    # "<site>.mp4", "sample.mkv", "videoplayback") that the matcher can pick instead
+    # of the real title. Refuse these so the caller re-matches, rather than symlinking
+    # a seconds-long file as the requested movie/episode.
+    try:
+        _src_size = os.path.getsize(source_path)
+        _src_base = os.path.basename(source_path).lower()
+    except OSError:
+        _src_size, _src_base = 0, ''
+    _junk_hints = ('rarbg', '.yts', 'yts.mx', 'eztv', 'sample', 'promo', 'trailer',
+                   '.part', 'hdsector', 'bbebbb', 'videoplayback', 'mp4u', '4000+',
+                   '.srt', '.nfo', '.txt', '.jpg', '.png')
+    _looks_junk = any(h in _src_base for h in _junk_hints) or _src_size < 20_000_000
+    if _looks_junk:
+        logging.warning(
+            f"[MATCH-GUARD] Refusing symlink of suspicious source {source_path} "
+            f"(size={_src_size}B, name='{_src_base}'). Item will be re-matched / reviewed."
+        )
+        return False
+    # -------------------------------------------------------------------------------
+
     symlink_ok_or_created = False
 
     # If destination exists and is a symlink, check if it points to the correct source
@@ -1301,6 +1324,16 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                             break
                 except Exception as ext_err:
                     logging.warning(f"Extended search failed: {ext_err}")
+
+            # 10. Check NAS paths as final fallback — item may have a local
+            #     transcoded copy in a configured NAS / Network Drive path.
+            if not found_file:
+                nas_match = check_local_file_in_nas_paths(item)
+                if nas_match:
+                    source_file = nas_match['path']
+                    source_folder = os.path.dirname(source_file)
+                    found_file = True
+                    logging.info(f"Found file in NAS path: {source_file}")
 
             # --- Handling not found after all checks ---
             if not found_file:
@@ -2092,16 +2125,276 @@ def recent_local_library_scan(items: List[Dict[str, Any]], max_files: int = 500)
     """
     Perform a recent local library scan for specific items.
     Checks the most recent files to see if they match any of the provided items.
-    
+
     Args:
         items: List of items to scan for
         max_files: Maximum number of recent files to check
-        
+
     Returns:
         Dict mapping item IDs to their found file information
     """
     # Disabled for now
     return {}
+
+
+# ── NAS / Network Drive file index ───────────────────────────────────────────
+# The NAS tree is walked ONCE and cached for _NAS_INDEX_TTL seconds so that
+# reconcile / queue loops (which may check many items) don't re-walk the whole
+# network mount for every item. The expensive filesystem operation is the walk;
+# per-item matching afterwards runs in memory over the cached index.
+
+_NAS_INDEX_TTL = 300           # seconds — aligned with the reconcile cache TTL
+_NAS_INDEX_LOCK = threading.Lock()
+_NAS_INDEX = {'paths': (), 'entries': [], 'built_at': 0.0, 'building': False}
+
+_VIDEO_EXTS = {
+    '.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.flv', '.webm',
+    '.ts', '.m2ts', '.iso', '.vob', '.divx', '.xvid', '.mpeg', '.mpg',
+}
+
+
+def _norm_media_name(name: str) -> str:
+    """Normalise a media title/filename for matching.
+
+    'The.Mummy.(1999).mkv' -> 'the mummy 1999 mkv'
+    'Show.S01E02.1080p'    -> 'show s01e02 1080p'
+
+    Lowercases, turns every run of non-alphanumeric characters into a single
+    space and collapses — so parens/dots in real filenames can no longer break
+    title+year / episode-marker substring matching.
+    """
+    if not name:
+        return ''
+    return ' '.join(re.sub(r'[^\w]', ' ', name.lower()).split())
+
+
+def _is_movie_item(item: Dict[str, Any]) -> bool:
+    media_type = (item.get('type') or item.get('media_type') or 'movie').lower()
+    return media_type in ('movie', 'film')
+
+
+def _year_tokens(name_norm: str) -> List[str]:
+    """4-digit year tokens found in a normalised filename (1900-2100, so
+    resolution numbers like 1080/2160 are excluded)."""
+    return [
+        t for t in name_norm.split()
+        if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2100
+    ]
+
+
+def _nas_result(path: str) -> Dict[str, Any]:
+    try:
+        size_gb = round(os.path.getsize(path) / (1024 ** 3), 2)
+    except OSError:
+        size_gb = 0.0
+    return {'path': path, 'size_gb': size_gb}
+
+
+def _has_any_season_token(name_norm: str) -> bool:
+    """True if a normalised filename contains a season marker (s01/s1/s01e02/'season 2').
+
+    (?=\b|e) lets 's02' match inside 's02e02' (the e is a word char, so a plain
+    \\b would miss it), while still requiring a token-ish boundary.
+    """
+    return bool(re.search(r'\bs\d{1,2}(?=\b|e)', name_norm)) or bool(re.search(r'\bseason \d', name_norm))
+
+
+def _episode_match_level(name_norm: str, season, episode) -> int:
+    """Match level for an episode filename vs season+episode (0 = no match)."""
+    se, ep = int(season), int(episode)
+    if f"s{se:02d}e{ep:02d}" in name_norm or f"s{se}e{ep}" in name_norm:
+        return 3                                   # S01E05 / S1E5 contiguous
+    if f"season {se} episode {ep}" in name_norm:
+        return 3                                   # spelled-out form
+    if f"s{se:02d}" in name_norm and f"e{ep:02d}" in name_norm:
+        return 2                                   # split tokens (multi-ep fx)
+    # Episode-number-only fallback — only when the filename carries NO season
+    # marker at all, otherwise a different season (e.g. 'S02E05') could match.
+    if not _has_any_season_token(name_norm) and (f"e{ep:02d}" in name_norm or f"e{ep}" in name_norm):
+        return 1
+    return 0
+
+
+def _season_match_level(name_norm: str, season) -> int:
+    se = int(season)
+    # Boundary-aware so 's01' matches inside 's01e05' but 's1' never matches
+    # inside 's12e05' (season 12).
+    if (re.search(rf'\bs{se:02d}(?=\b|e)', name_norm)
+            or re.search(rf'\bs{se}(?=\b|e)', name_norm)
+            or f"season {se}" in name_norm):
+        return 2
+    return 0
+
+
+def get_nas_file_index(nas_paths: Optional[List[str]] = None,
+                       force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Walk the configured NAS / Network Drive paths once and return a cached
+    index of video files: [{'path', 'name', 'norm'}].
+
+    The cache key is the tuple of NAS roots and expires after _NAS_INDEX_TTL.
+    Scanning is capped at 4 directory levels below each root — NAS libraries are
+    typically Plex-organised 2-3 levels deep (Movies/Show (year)/file.mkv).
+    """
+    if nas_paths is None:
+        nas_paths = get_nas_paths()
+    if not nas_paths:
+        return []
+    paths_key = tuple(p.rstrip('/') for p in nas_paths if p and p.strip())
+    if not paths_key:
+        return []
+
+    with _NAS_INDEX_LOCK:
+        if (not force_refresh
+                and _NAS_INDEX['paths'] == paths_key
+                and not _NAS_INDEX['building']
+                and (time.time() - _NAS_INDEX['built_at']) < _NAS_INDEX_TTL):
+            return _NAS_INDEX['entries']
+        if _NAS_INDEX['building']:
+            # Another thread is rebuilding the same paths — serve the previous
+            # complete snapshot instead of a half-built list.
+            return _NAS_INDEX['entries']
+        _NAS_INDEX['building'] = True
+
+    # Walk outside the lock — this is the expensive part (network mount).
+    walk_start = time.time()
+    new_entries: List[Dict[str, Any]] = []
+    for nas_root in paths_key:
+        if not os.path.isdir(nas_root):
+            logging.debug(f"[NAS_Scan] NAS root not accessible: {nas_root}")
+            continue
+        try:
+            for root, dirs, files in os.walk(nas_root, topdown=True, followlinks=False):
+                rel = os.path.relpath(root, nas_root)
+                if rel != '.' and rel.count(os.sep) > 4:
+                    dirs.clear()                   # don't descend deeper than 4 levels
+                    continue
+                for fname in files:
+                    name, ext = os.path.splitext(fname)
+                    if ext.lower() not in _VIDEO_EXTS:
+                        continue
+                    new_entries.append({
+                        'path': os.path.join(root, fname),
+                        'name': name,
+                        'norm': _norm_media_name(name),
+                    })
+        except PermissionError:
+            logging.debug(f"[NAS_Scan] Permission denied scanning {nas_root}")
+        except Exception as exc:
+            logging.debug(f"[NAS_Scan] Error scanning {nas_root}: {exc}")
+
+    with _NAS_INDEX_LOCK:
+        _NAS_INDEX['paths'] = paths_key
+        _NAS_INDEX['entries'] = new_entries
+        _NAS_INDEX['built_at'] = time.time()
+        _NAS_INDEX['building'] = False
+
+    logging.info(f"[NAS_Scan] Indexed {len(new_entries)} video file(s) across "
+                 f"{len(paths_key)} NAS path(s) in {time.time() - walk_start:.2f}s")
+    return new_entries
+
+
+def check_local_file_in_nas_paths(item: Dict[str, Any],
+                                  nas_index: Optional[List[Dict[str, Any]]] = None,
+                                  force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    """Search the configured NAS / Network Drive paths for the item's media file.
+
+    The single best-scoring match across the whole index wins:
+
+      1. Exact original-filename match — when the item knows its source file
+         (filled_by_file), an identical normalised basename is the strongest
+         signal.
+      2. Movies — the title must appear; a candidate whose filename carries a
+         *different* year than the item is rejected outright. A matching year
+         token scores 3, a filename with no year at all scores 2.
+      3. TV episodes — the show title PLUS the episode marker (S01E02,
+         'season 1 episode 2', or split s01/e02 tokens) must appear. A bare
+         show-title hit never satisfies an episode, which prevents one episode
+         of a show from validating a missing episode's check.
+      4. Season packs — show title plus a season marker (S01 / 'season 1').
+
+    Returns {'path': str, 'size_gb': float} or None.
+    """
+    start_time = time.time()
+    try:
+        title = (item.get('title') or '').strip()
+        if not title:
+            return None
+
+        title_norm = _norm_media_name(title)
+        if not title_norm:
+            return None
+
+        if nas_index is None:
+            nas_index = get_nas_file_index(force_refresh=force_refresh)
+        if not nas_index:
+            return None
+
+        year_str = str(item.get('year') or '').strip()
+        is_movie = _is_movie_item(item)
+        season = item.get('season_number')
+        episode = item.get('episode_number')
+
+        # 1. Exact original-filename match (strongest — return immediately).
+        # The index stores the name WITHOUT its extension, so strip the ext here
+        # before normalising.
+        original = (item.get('filled_by_file') or '').strip()
+        if original:
+            orig_norm = _norm_media_name(os.path.splitext(os.path.basename(original))[0])
+            if orig_norm:
+                for entry in nas_index:
+                    if entry['norm'] == orig_norm:
+                        logging.debug(
+                            f"[NAS_Scan] '{title}': exact filename match -> {entry['path']}"
+                        )
+                        return _nas_result(entry['path'])
+
+        # 2-4. Score every index entry, keep the best match.
+        best_level = 0
+        best_entry = None
+        for entry in nas_index:
+            name_norm = entry['norm']
+            if not name_norm or title_norm not in name_norm:
+                continue
+
+            level = 0
+            if is_movie:
+                years = _year_tokens(name_norm)
+                if year_str and year_str in years:
+                    level = 3                       # title + matching year
+                elif not years:
+                    level = 2                       # title, filename has no year
+                # else: filename has a conflicting year — not this movie.
+            else:
+                if season is not None and episode is not None:
+                    level = _episode_match_level(name_norm, season, episode)
+                elif season is not None:
+                    level = _season_match_level(name_norm, season)
+                elif episode is not None:
+                    ep = int(episode)
+                    level = 2 if (
+                        not _has_any_season_token(name_norm)
+                        and (f"e{ep:02d}" in name_norm or f"episode {ep}" in name_norm)
+                    ) else 0
+                # else: bare show-title only — never enough for a release check.
+
+            if level > best_level:
+                best_level = level
+                best_entry = entry
+                if level >= 3:
+                    break
+
+        if best_entry:
+            elapsed = time.time() - start_time
+            logging.info(
+                f"[NAS_Scan] Found '{title}' in NAS path -> {best_entry['path']} "
+                f"(match level {best_level}, {elapsed:.2f}s)"
+            )
+            return _nas_result(best_entry['path'])
+
+    except Exception as exc:
+        logging.error(f"[NAS_Scan] Error checking NAS paths for item {item.get('id', '?')}: {exc}")
+
+    return None
 
 def convert_item_to_symlink(item: Dict[str, Any], skip_verification: bool = False) -> Dict[str, Any]:
     """

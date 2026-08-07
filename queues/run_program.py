@@ -3,6 +3,10 @@ import random
 import time
 import os
 import sqlite3
+
+# Reconcile cadence (drives the auto clean_unservable pass). Read at import time
+# so __init__ / task scheduling don't hit an unbound-local 'os'.
+TASK_RECONCILE_INTERVAL_SECONDS = int(os.environ.get('RECONCILE_INTERVAL_SECONDS', '3600'))
 import plexapi # Added import
 import uuid
 import ctypes
@@ -259,7 +263,7 @@ class ProgramRunner:
         # Base Task Intervals
         self.task_intervals = {
             # Queue Processing Tasks (intervals for individual queues are less critical now)
-            'Wanted': 60,             # Increased from 5
+            'Wanted': 15,             # Reduced from 60 to speed up scrape kickoff
             'Scraping': 1,           # Increased from 5
             'Adding': 1,             # Increased from 5
             'Checking': 30,
@@ -282,7 +286,7 @@ class ProgramRunner:
             'task_precompute_airing_shows': 600,   # Precompute airing shows every 10 minutes
             'task_verify_symlinked_files': 7200,    # Run every 120 minutes (if enabled)
             'task_verify_plex_removals': 900,      # Run every 15 minutes (if enabled) - supports both Plex and Jellyfin/Emby
-            'task_reconcile_queues': 3600,         # Run every 1 hour
+            'task_reconcile_queues': TASK_RECONCILE_INTERVAL_SECONDS,         # Run every 1 hour (configurable); drives clean_unservable too
             'task_check_database_health': 3600,    # Run every hour
             'task_sync_time': 3600,                # Run every hour
             'task_check_trakt_early_releases': 7200,# Run every 2 hours (reduced to minimize API calls)
@@ -339,6 +343,7 @@ class ProgramRunner:
             'task_upgrade_hub_scan': 24 * 60 * 60, # Run every 24 hours (disabled by default)
             'task_upgrade_hub_auto_queue': 24 * 60 * 60, # Run every 24 hours (disabled by default)
             'task_trim_memory': 60 * 60, # Run every hour
+            'task_nas_source_adoption': 30 * 60, # Run every 30 min (gated by time-of-day latch; replaces symlinks with verified NAS copies)
         }
         # Store original intervals for reference (will be updated after content sources)
         self.original_task_intervals = self.task_intervals.copy()
@@ -710,6 +715,20 @@ class ProgramRunner:
                 if task_name in self.enabled_tasks and not is_toggled_on:
                      self.enabled_tasks.remove(task_name)
                      logging.info(f"Disabled '{task_name}' as Debug setting is off.")
+
+        # NAS Source Adoption — replaces collected debrid symlinks with verified
+        # NAS copies. Only meaningful in Symlinked/Local mode (the job re-checks).
+        _nas_adopt_task = 'task_nas_source_adoption'
+        if get_setting('NAS Source Adoption', 'enabled', False):
+            _nas_adopt_toggled_off = saved_states.get(self._normalize_task_name(_nas_adopt_task), True) is False
+            if not _nas_adopt_toggled_off and _nas_adopt_task not in self.enabled_tasks:
+                self.enabled_tasks.add(_nas_adopt_task)
+                logging.info(f"Enabled '{_nas_adopt_task}' based on NAS Source Adoption setting.")
+        else:
+            _nas_adopt_toggled_on = saved_states.get(self._normalize_task_name(_nas_adopt_task), False) is True
+            if _nas_adopt_task in self.enabled_tasks and not _nas_adopt_toggled_on:
+                self.enabled_tasks.remove(_nas_adopt_task)
+                logging.info(f"Disabled '{_nas_adopt_task}' as NAS Source Adoption is off.")
 
         # Enable Plex smart collection poster task if Plex is configured and not Jellyfin symlink mode
         _fm = get_setting('File Management', 'file_collection_management', '')
@@ -5263,6 +5282,133 @@ class ProgramRunner:
         finally:
             if conn: conn.close() # Ensure connection is closed
 
+        # Auto-cleanup: requeue unservable Collected items (DB-consistent) so
+        # re-selection finds a servable source. Bounded per pass.
+        try:
+            self._clean_unservable_pass()
+        except Exception as _ce:
+            logging.exception(f"[CleanUnservable] auto pass failed: {_ce}")
+
+    def _clean_unservable_pass(self, max_items: int = None, max_probe: int = None,
+                               probe_timeout: float = None):
+        """Move Collected items whose source symlink is missing/unreadable
+        (decypharr can't serve -> empty_link) back to Wanted, marking the source
+        bad, so the item re-scrapes to a servable source. Runs every reconcile.
+        Probes the newest Collected items (newest-id first).
+
+        Configurable via env: CLEAN_UNSERVABLE_MAX_ITEMS (default 200),
+        CLEAN_UNSERVABLE_MAX_PROBE (default 400), CLEAN_UNSERVABLE_TIMEOUT (8s)."""
+        try:
+            max_items = int(os.environ.get('CLEAN_UNSERVABLE_MAX_ITEMS', '200')) if max_items is None else max_items
+            max_probe = int(os.environ.get('CLEAN_UNSERVABLE_MAX_PROBE', '400')) if max_probe is None else max_probe
+            probe_timeout = float(os.environ.get('CLEAN_UNSERVABLE_TIMEOUT', '8')) if probe_timeout is None else probe_timeout
+        except Exception:
+            max_items = max_items if max_items is not None else 200
+            max_probe = max_probe if max_probe is not None else 400
+            probe_timeout = probe_timeout if probe_timeout is not None else 8.0
+        import subprocess as _sub, os as _os, re as _re
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        rows = None
+        try:
+            from database.core import get_db_connection
+            _c = get_db_connection()
+            cur = _c.cursor()
+            cur.execute(
+                "SELECT id, location_on_disk, filled_by_torrent_id FROM media_items "
+                "WHERE state='Collected' AND location_on_disk IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?", (max_probe,)
+            )
+            rows = cur.fetchall()
+            _c.close()
+        except Exception as e:
+            logging.debug(f"[CleanUnservable] query failed: {e}")
+            return
+        if not rows:
+            return
+
+        def _servable(p):
+            if not _os.path.lexists(p):
+                return False
+            try:
+                if _os.stat(p).st_size <= 1_048_576:
+                    return False
+            except OSError:
+                return False
+            try:
+                r = _sub.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", p],
+                    capture_output=True, text=True, timeout=probe_timeout,
+                )
+                try:
+                    return float((r.stdout or "").strip()) > 0
+                except ValueError:
+                    return False
+            except Exception:
+                return False
+
+        unservable = []
+        with ThreadPoolExecutor(max_workers=min(8, len(rows))) as ex:
+            fut = {ex.submit(_servable, r[1]): r for r in rows if r[1]}
+            for fd in as_completed(fut):
+                try:
+                    ok = fd.result()
+                except Exception:
+                    ok = False
+                if not ok:
+                    unservable.append(fut[fd])
+        unservable = unservable[:max_items]
+        if not unservable:
+            logging.info(
+                f"[CleanUnservable] auto pass probed {len(rows)} Collected item(s), "
+                f"0 unservable — nothing to requeue"
+            )
+            return
+
+        from database.bad_sources import mark_bad_source as _mbs, is_bad_source as _ibs
+        _hash = lambda p: ((_re.search(r"([0-9a-f]{40})", p or "") or [None, ""])[1] or "")
+
+        moved = 0
+        marked = 0
+        for rid, loc, tb in unservable:
+            h = _hash(loc) or ""
+            if not h and tb:
+                try:
+                    from debrid import get_debrid_provider as _gdp
+                    _info = _gdp().get_torrent_info(tb)
+                    h = (_info or {}).get('hash') or ""
+                except Exception:
+                    h = ""
+            if h and not _ibs(h):
+                try:
+                    _mbs(h, 'unservable_sweep')
+                    marked += 1
+                except Exception:
+                    pass
+            try:
+                from database.core import get_db_connection
+                _c = get_db_connection()
+                c2 = _c.cursor()
+                c2.execute(
+                    "UPDATE media_items SET state='Wanted', filled_by_torrent_id=NULL,"
+                    " filled_by_magnet=NULL, filled_by_file=NULL, filled_by_title=NULL,"
+                    " scrape_results=NULL WHERE id=? AND state='Collected'", (rid,))
+                _c.commit()
+                _c.close()
+                moved += 1
+            except Exception:
+                pass
+            try:
+                if _os.path.islink(loc) or _os.path.isfile(loc):
+                    _os.unlink(loc)
+            except OSError:
+                pass
+        if unservable:
+            logging.info(
+                f"[CleanUnservable] auto pass requeued {moved} unservable Collected "
+                f"item(s) to Wanted ({marked} source(s) marked bad)"
+            )
+
     def reinitialize(self):
         """Force reinitialization of the program runner to pick up new settings"""
         logging.info("Reinitializing ProgramRunner...")
@@ -7423,6 +7569,20 @@ class ProgramRunner:
         """Run library maintenance tasks."""
         from database.maintenance import run_library_maintenance
         run_library_maintenance()
+
+    def task_nas_source_adoption(self):
+        """Nightly job: replace collected debrid symlinks with verified NAS copies.
+
+        Gated inside run_nas_source_adoption() by settings, mode, NAS paths and a
+        time-of-day latch, so this interval task only acts once per day at the
+        configured run_time (default 03:00).
+        """
+        try:
+            from utilities.nas_source_adoption import run_nas_source_adoption
+            summary = run_nas_source_adoption(force=False)
+            logging.info(f"[NAS_Adopt] Task summary: {summary}")
+        except Exception as exc:
+            logging.error(f"[NAS_Adopt] Task failed: {exc}", exc_info=True)
 
     def task_sync_library_metadata(self):
         """Sync audio/subtitle track metadata from Plex/Jellyfin for collected items."""

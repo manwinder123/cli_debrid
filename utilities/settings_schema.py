@@ -2863,6 +2863,60 @@ SETTINGS_SCHEMA = {
             "default": True
         }
     },
+    "NAS Source Adoption": {
+        "tab": "Additional Settings",
+        "enabled": {
+            "type": "boolean",
+            "description": "Enable the nightly NAS Source Adoption job. In Symlinked/Local mode it replaces a collected item's debrid symlink with a verified local NAS / Network Drive copy (e.g. Tdarr transcode), and updates the item to use the NAS source. Only runs when NAS / Network Drive paths are configured.",
+            "default": False
+        },
+        "adopt_movies": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for regular movies (non-anime).",
+            "default": True
+        },
+        "adopt_tv_shows": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for regular TV shows / episodes (non-anime).",
+            "default": True
+        },
+        "adopt_anime_movies": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for anime movies.",
+            "default": True
+        },
+        "adopt_anime_tv": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for anime TV shows / episodes.",
+            "default": True
+        },
+        "adopt_documentary_movies": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for documentary movies (detected by the 'Documentary' genre).",
+            "default": True
+        },
+        "adopt_documentary_tv": {
+            "type": "boolean",
+            "description": "Adopt NAS sources for documentary TV shows / episodes (detected by the 'Documentary' genre).",
+            "default": True
+        },
+        "run_time": {
+            "type": "string",
+            "description": "Local time (HH:MM) to run the NAS Source Adoption job each day.",
+            "default": "03:00",
+            "validate": "time"
+        },
+        "verify_in_plex": {
+            "type": "boolean",
+            "description": "Only replace the symlink when Plex has already scanned the NAS copy. The symlink is never deleted unless the NAS file is confirmed in Plex.",
+            "default": True
+        },
+        "delete_rd_torrent": {
+            "type": "boolean",
+            "description": "After adopting the NAS source, also delete the debrid torrent from the provider. USE WITH CAUTION - this frees debrid space but the torrent must be re-added to get the media back.",
+            "default": False
+        }
+    },
     "Discover Settings": {
         "tab": "Additional Settings",
         "hide_no_rating": {
