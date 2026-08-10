@@ -1318,6 +1318,16 @@ class DirectAPI:
                     logger.debug(f"TMDB External IDs API call: {url.replace(tmdb_api_key, 'REDACTED')}")
                     resp = req.get(url, timeout=10)
                     logger.debug(f"TMDB External IDs response status: {resp.status_code}")
+                    if resp.status_code == 404 and media_type:
+                        # Plex watchlists can misreport tv-movies/specials as
+                        # 'movie' (or vice versa); TMDB only exposes the id under
+                        # the correct type endpoint, so retry the other one.
+                        alt_endpoint = 'tv' if endpoint == 'movie' else 'movie'
+                        alt_url = f"https://api.themoviedb.org/3/{alt_endpoint}/{tmdb_id}/external_ids?api_key={tmdb_api_key}"
+                        logger.debug(f"TMDB External IDs alt-type retry: {alt_url.replace(tmdb_api_key, 'REDACTED')}")
+                        alt_resp = req.get(alt_url, timeout=10)
+                        if alt_resp.status_code == 200:
+                            resp = alt_resp
                     if resp.status_code == 200:
                         tmdb_data = resp.json()
                         tmdb_imdb = tmdb_data.get('imdb_id')

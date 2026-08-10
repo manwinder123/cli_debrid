@@ -348,6 +348,29 @@ def download_subtitles_for_video(video_path, rating_key=None, name_hint=None):
         logging.info(f"🎬 Processing: {original_path.name} (parsing as: {parse_name})")
         video = Video.fromname(parse_name)
         video.path = original_path  # Set to original path so subtitles are saved alongside the symlink
+
+        # guessit can return season/episode as a *list* of alternatives when the
+        # parsed name carries multiple numbered forms (e.g. a Plex-style
+        # "... - S03E19 - ... (Release S01E59 ...).mkv" → season=[3,1],
+        # episodes=[19,59]). Providers require plain integers — a list sent to
+        # OpenSubtitles' XML-RPC API returns "408 Invalid parameters; season is
+        # not number" and the whole search fails. Take the first alternative
+        # (Plex/TMDB numbering wins) and fall back to None if unparseable.
+        def _first_int(value):
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple, set)):
+                value = value[0] if value else None
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        if hasattr(video, 'season') and hasattr(video, 'episodes'):
+            video.season = _first_int(video.season)
+            video.episodes = [e for e in map(_first_int, video.episodes) if e is not None]
         
         # Build provider configurations
         provider_configs = build_provider_configs()

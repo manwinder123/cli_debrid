@@ -1094,6 +1094,15 @@ def get_release_date(media_details: Dict[str, Any], imdb_id: Optional[str] = Non
     if old_premiere_releases:
         return max(old_premiere_releases).strftime("%Y-%m-%d")
 
+    # Final fallback: a theatrical date that has already passed is still a valid
+    # release reference for brand-new titles (e.g. a film currently in theaters
+    # with no digital/physical date on TMDB yet, like Dune: Part Three) —
+    # otherwise they stay 'Unknown' until the 180-day threshold. Only past
+    # dates are used, never future announcements.
+    recent_past_theatrical = [date for date in theatrical_releases if date <= current_date]
+    if recent_past_theatrical:
+        return max(recent_past_theatrical).strftime("%Y-%m-%d")
+
     # If we've reached this point, there are no suitable release dates
     logging.warning(f"No valid release date found for IMDb ID: {imdb_id}. "
                     f"digital/physical={len(digital_physical_releases)}, "

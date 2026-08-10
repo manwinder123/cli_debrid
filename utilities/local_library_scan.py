@@ -785,9 +785,18 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
         imdb_id = item.get('imdb_id', '')
         if imdb_id == 'tt0000000':
             imdb_id = ''
-            
+
+        # Providers sometimes deliver the year embedded in the title
+        # (e.g. "Yellowstone (2018)") and the daily cleanup task only strips it
+        # on its next pass — so the "{title} ({year})" templates below would
+        # produce a duplicated-year folder ("Yellowstone (2018) (2018)") that
+        # Plex treats as a separate show. Strip a trailing " (YYYY)" here so
+        # symlink/DAS folder names never repeat the year.
+        _raw_title = str(item.get('title', 'Unknown'))
+        _title = re.sub(r'\s*\(\d{4}\)\s*$', '', _raw_title).strip() or _raw_title
+
         template_vars = {
-            'title': item.get('title', 'Unknown'),
+            'title': _title,
             'year': item.get('year', ''),
             'imdb_id': imdb_id,
             'tmdb_id': item.get('tmdb_id', ''),
@@ -1442,7 +1451,8 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             success = False
             
             # Create item identifier first
-            item_identifier = f"{item.get('title')} ({item.get('year', '')})"
+            _ident_title = re.sub(r"\s*\(\d{4}\)\s*$", "", str(item.get("title") or ""))
+            item_identifier = f"{_ident_title} ({item.get('year', '')})"
             if item.get('type') == 'episode':
                 item_identifier += f" S{item.get('season_number', '00'):02d}E{item.get('episode_number', '00'):02d}"
             
