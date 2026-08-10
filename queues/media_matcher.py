@@ -263,6 +263,41 @@ class MediaMatcher:
             logging.debug(f"Match failed: Strict matching requires season, but item season is None and not using XEM.")
             return False
 
+        # --- TITLE VERIFICATION (TV) ------------------------------------------
+        # The movie path verifies source-name vs wanted title; the episode path
+        # historically did not, so unrelated packs could match purely by SxxExx
+        # structure (e.g. a "Guardians of the Dafeng" pack collected as Bob's
+        # Burgers). Refuse when the text BEFORE the first episode tag is a clear
+        # mismatch with the wanted show. Only trust that prefix when it is
+        # substantial (>=6 alnum chars) — abbreviations ("GOT.") and
+        # episode-title-first names ("S08E01 Brunchsquatch.mkv") are skipped,
+        # and anime (relaxed) matching is untouched.
+        if not use_relaxed_matching:
+            try:
+                _orig = ptt_result.get('original_filename', '') or ''
+                _tag = re.search(
+                    r'\bS\d{1,2}\s*[Ee]\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bSeason\s+\d{1,2}\b',
+                    _orig, re.IGNORECASE,
+                )
+                _prefix = _orig[: _tag.start()] if _tag else _orig
+                _alnum = len(re.findall(r'[a-z0-9]', _prefix, re.IGNORECASE))
+                if _alnum >= 6:
+                    _r, _t = _prefix.lower(), series_title.lower()
+                    _wr = set(re.findall(r'[a-z0-9]+', _r))
+                    _wt = set(re.findall(r'[a-z0-9]+', _t))
+                    _word_ov = (len(_wr & _wt) / max(len(_wr), len(_wt))) if _wr and _wt else 0.0
+                    _sim = max(_word_ov, fuzz.partial_ratio(_r, _t) / 100.0)
+                    if _sim < 0.20:
+                        logging.warning(
+                            f"[MATCH-GUARD] Refusing episode match for '{series_title}' "
+                            f"S{target_season}E{target_episode}: source prefix "
+                            f"'{_prefix.strip()[:60]}' similarity {_sim:.2f} < 0.20. "
+                            f"Item will be re-matched / reviewed."
+                        )
+                        return False
+            except Exception as _tvexc:
+                logging.debug(f"Title verification skipped: {_tvexc}")
+
         # --- Check if this is anime content ---
         genres = item.get('genres') or []
         if isinstance(genres, str):
