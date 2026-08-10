@@ -332,8 +332,22 @@ class ScrapingQueue:
                             if str(item_id_being_processed) == DEBUG_ITEM_ID:
                                 # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] DEFERRED - related item found in Adding Queue.")
                                 pass
-                            # logging.info(f"Deferring processing for {item_identifier} (IMDb: {item_imdb_id}) - related item found in Adding Queue.")
-                            return False # Defer processing, keep item in queue
+                            # Defer this item (a sibling is being added — avoid
+                            # duplicate adds), but ROTATE it to the back instead
+                            # of returning False. Returning False made the batch
+                            # loop in queue_manager.process_scraping() break,
+                            # starving the ENTIRE queue behind this one item when
+                            # it sat at index 0 (the queue sorts by imdb_id, so a
+                            # stuck Adding sibling with a low tt-id blocked every
+                            # other show indefinitely).
+                            logging.info(
+                                f"Deferring {item_identifier} (sibling in Adding), "
+                                f"rotating to back of queue"
+                            )
+                            processed_successfully_or_moved = True
+                            if self.items and self.items[0].get('id') == item_id_being_processed:
+                                self.items.append(self.items.pop(0))
+                            return True
                         elif str(item_id_being_processed) == DEBUG_ITEM_ID:
                             # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] PASSED Adding Queue check (no related item found).")
                             pass
