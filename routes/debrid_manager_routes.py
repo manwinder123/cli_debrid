@@ -3324,6 +3324,125 @@ def api_reconcile_bulk_requeue():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@debrid_manager_bp.route('/api/reconcile/external_collect', methods=['POST'])
+@admin_required
+def api_reconcile_external_collect():
+    """Mark items Collected with files placed by an external fetcher (e.g.
+    archive_fetch.py pulling old content from Archive.org).
+
+    Body: {"items": [{"item_id": int, "file_path": str, "source_title": str}]}
+
+    Mirrors the fields cli_debrid sets when it collects via a symlink
+    (utilities/local_library_scan.py): state=Collected, location_on_disk,
+    original_path_for_symlink, filled_by_file, collected_at. Post-processing
+    (subtitle downloader, size/resolution) runs in a background thread so the
+    API returns immediately.
+    """
+    from database.core import get_db_connection
+    from database.database_writing import update_media_item
+    from database.database_writing import update_media_item_state
+    from database import get_media_item_by_id
+    from utilities.post_processing import handle_state_change
+
+    data = request.get_json(silent=True) or {}
+    items = data.get('items', [])
+    if not items or not isinstance(items, list):
+        return jsonify({'success': False, 'error': 'items[] required'}), 400
+
+    now = time.strftime('%Y-%m-%d %H:%M:%S')
+    updated = []
+    errors = []
+    processed_ids = []
+    for it in items:
+        try:
+            item_id = int(it.get('item_id'))
+            file_path = (it.get('file_path') or '').strip()
+            if not file_path:
+                errors.append({'item_id': item_id, 'error': 'file_path required'})
+                continue
+            source_title = (it.get('source_title') or '').strip()
+            cur = get_db_connection().execute(
+                "SELECT id, state FROM media_items WHERE id = ?", (item_id,)
+            )
+            row = cur.fetchone()
+            cur.connection.close()
+            if not row:
+                errors.append({'item_id': item_id, 'error': 'not found'})
+                continue
+            if row['state'] == 'Collected':
+                errors.append({'item_id': item_id, 'error': 'already collected'})
+                continue
+            update_media_item(
+                item_id,
+                location_on_disk=file_path,
+                original_path_for_symlink=file_path,
+                filled_by_file=os.path.basename(file_path),
+                filled_by_title=source_title or 'Archive.org',
+                collected_at=now,
+                original_collected_at=now,
+                blacklisted_date=None,
+                wake_count=0,
+                sleep_cycles=0,
+            )
+            update_media_item_state(item_id, 'Collected')
+            updated.append(item_id)
+            processed_ids.append(item_id)
+        except Exception as exc:  # noqa: BLE001
+            logging.error(f"[ExternalCollect] item {it.get('item_id')}: {exc}")
+            errors.append({'item_id': it.get('item_id'), 'error': str(exc)})
+
+    # Background post-processing (subtitles, size/resolution) — never block the API.
+    if processed_ids:
+        def _post_process(ids):
+            try:
+                for iid in ids:
+                    fresh = get_media_item_by_id(iid)
+                    if fresh:
+                        handle_state_change(dict(fresh))
+            except Exception as exc:  # noqa: BLE001
+                logging.error(f"[ExternalCollect] post-process: {exc}")
+        threading.Thread(target=_post_process, args=(list(processed_ids),), daemon=True).start()
+
+    return jsonify({'success': True, 'updated': updated, 'errors': errors})
+
+
+@debrid_manager_bp.route('/api/reconcile/external_requeue', methods=['POST'])
+@admin_required
+def api_reconcile_external_requeue():
+    """Move stuck items back to Wanted for re-scraping (any non-Collected
+    state: Checking, Collected-orphans are covered by bulk_requeue, but
+    Checking/Scraping items stuck on dead torrents need this too).
+
+    Body: {"item_ids": [int, ...]}
+    """
+    from database.core import get_db_connection
+    data = request.get_json(silent=True) or {}
+    item_ids = data.get('item_ids', [])
+    if not item_ids or not isinstance(item_ids, list):
+        return jsonify({'success': False, 'error': 'item_ids required'}), 400
+    try:
+        conn = get_db_connection()
+        updated = 0
+        for iid in item_ids:
+            try:
+                conn.execute(
+                    "UPDATE media_items SET state='Wanted', filled_by_torrent_id=NULL,"
+                    " filled_by_magnet=NULL, filled_by_file=NULL, filled_by_title=NULL,"
+                    " scrape_results=NULL WHERE id=? AND state != 'Collected'",
+                    (int(iid),)
+                )
+                updated += conn.execute("SELECT changes()").fetchone()[0]
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        _reconcile_cache['data'] = None
+        return jsonify({'success': True, 'updated': updated})
+    except Exception as e:
+        logging.error(f"[Reconcile] external_requeue error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @debrid_manager_bp.route('/api/reconcile/bulk_delete_db', methods=['POST'])
 @admin_required
 def api_reconcile_bulk_delete_db():
