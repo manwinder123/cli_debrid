@@ -932,6 +932,16 @@ def check_database_symlinks(cursor, symlink_base_path):
             
         item_id, title, item_type, original_path, location_on_disk, version = item
         full_symlink_path = os.path.join(symlink_base_path, location_on_disk)
+
+        # Items whose recorded location is OUTSIDE the symlink tree (e.g.
+        # /mnt/das_pool/... adopted by an external fetcher like archive_fetch.py,
+        # or a NAS path) are not symlink-managed: a REGULAR file there is the
+        # correct state, not a "broken" symlink. Flagging them would requeue
+        # perfectly good collected content every maintenance run.
+        symlink_prefix = os.path.join(symlink_base_path, '')
+        if not full_symlink_path.startswith(symlink_prefix):
+            continue
+
         parent_folder = os.path.dirname(full_symlink_path)
         checked_folders.add(parent_folder)
         
