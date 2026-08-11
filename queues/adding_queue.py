@@ -877,13 +877,26 @@ class AddingQueue:
             if "No matching files found in torrent" in error or \
                "No matching files found in parsed files" in error or \
                "No valid video files found in torrent" in error:
-                logging.info(f"Media matching failed for {item_identifier}, moving back to Wanted queue. Error: {error}")
-                # Remove torrent if ID is present
-                if item.get('torrent_id'):
-                    self.remove_unwanted_torrent(item['torrent_id'])
-                queue_manager.move_to_wanted(item, "Adding")
-                # move_to_wanted handles removing from self.items
-                return
+                # First no-match: bounce to Wanted so the item can find a
+                # different source, but mark it (fall_back_to_single_scraper)
+                # so a REPEAT falls through to the bounded handling below —
+                # old items blacklist, new items sleep — instead of looping
+                # Scraping→Adding→Wanted forever. TorBox intermittently returns
+                # an empty file list for added packs, and without this bound
+                # those items churn indefinitely (SpongeBob S03/S04 bounced
+                # hundreds of times with zero blacklists).
+                current_item_data = get_media_item_by_id(item_id) if item_id else None
+                if not (current_item_data or {}).get('fall_back_to_single_scraper'):
+                    logging.info(f"Media matching failed for {item_identifier}, moving back to Wanted queue. Error: {error}")
+                    if item_id:
+                        update_media_item(item_id, fall_back_to_single_scraper=True)
+                    if item.get('torrent_id'):
+                        self.remove_unwanted_torrent(item['torrent_id'])
+                    queue_manager.move_to_wanted(item, "Adding")
+                    # move_to_wanted handles removing from self.items
+                    return
+                # Repeat no-match: fall through to the generic failure handling.
+                logging.info(f"Repeat media matching failure for {item_identifier}, applying bounded handling. Error: {error}")
 
             # --- NEW: Handle filename/title filter match ---
             elif "matched filter-out list" in error:
