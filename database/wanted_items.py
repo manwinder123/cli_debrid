@@ -425,20 +425,25 @@ def add_wanted_items(media_items_batch: List[Dict[str, Any]], versions_input, un
                         break
 
             if is_blacklisted_in_db:
-                if not enable_granular_versions:
-                    # If unblacklist is enabled and item is only blacklisted (not ghostlisted), reset it
-                    if unblacklist and not is_ghostlisted_in_db:
-                        db_item_id = _get_existing_item_id_any_state(conn, imdb_id, tmdb_id, item_type, item)
-                        if db_item_id:
-                            conn.execute(
-                                "UPDATE media_items SET state='Wanted', blacklisted_date=NULL, sleep_cycles=0 WHERE id=?",
-                                (db_item_id,)
-                            )
-                            conn.commit()
-                            logging.info(f"Unblacklisted item id={db_item_id} ({item.get('title', 'Unknown')}) per source unblacklist setting")
-                            # Allow item to proceed — do not skip
-                    else:
-                        skip_stats['existing_blacklisted'] += 1; items_skipped += 1; continue
+                # If unblacklist is enabled and item is only blacklisted (not ghostlisted), reset it.
+                # Apply in BOTH modes: with enable_granular_version_additions the old
+                # `if not enable_granular_versions:` gate silently skipped this branch,
+                # so unblacklist_on_source_run never fired (Plex Watchlist_1's 1,216
+                # blacklisted items stayed blacklisted forever). In granular mode the
+                # version check below then sees the version as "existing" and skips the
+                # duplicate add — the item simply stays Wanted and the queue re-scrapes it.
+                if unblacklist and not is_ghostlisted_in_db:
+                    db_item_id = _get_existing_item_id_any_state(conn, imdb_id, tmdb_id, item_type, item)
+                    if db_item_id:
+                        conn.execute(
+                            "UPDATE media_items SET state='Wanted', blacklisted_date=NULL, sleep_cycles=0 WHERE id=?",
+                            (db_item_id,)
+                        )
+                        conn.commit()
+                        logging.info(f"Unblacklisted item id={db_item_id} ({item.get('title', 'Unknown')}) per source unblacklist setting")
+                        # Allow item to proceed — do not skip
+                elif not enable_granular_versions:
+                    skip_stats['existing_blacklisted'] += 1; items_skipped += 1; continue
 
             # Check if item is already Collected or Upgrading (prevent duplicate re-addition)
             is_collected_or_upgrading_in_db = False
