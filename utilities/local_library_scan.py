@@ -972,14 +972,18 @@ def create_symlink(source_path: str, dest_path: str, media_item_id: int = None, 
     # "<site>.mp4", "sample.mkv", "videoplayback") that the matcher can pick instead
     # of the real title. Refuse these so the caller re-matches, rather than symlinking
     # a seconds-long file as the requested movie/episode.
+    # NOTE: release-group/site tags (rarbg, yts, eztv) are deliberately NOT hints —
+    # "show.s01e01.1080p.eztv.re.mkv" is a 2-4 GB legit release and was refused
+    # thousands of times (Abbott Elementary, Last Week Tonight, SpongeBob). The
+    # 20 MB floor below catches the standalone promo files this guard targets.
     try:
         _src_size = os.path.getsize(source_path)
         _src_base = os.path.basename(source_path).lower()
     except OSError:
         _src_size, _src_base = 0, ''
-    _junk_hints = ('rarbg', '.yts', 'yts.mx', 'eztv', 'sample', 'promo', 'trailer',
-                   '.part', 'hdsector', 'bbebbb', 'videoplayback', 'mp4u', '4000+',
-                   '.srt', '.nfo', '.txt', '.jpg', '.png')
+    _junk_hints = ('sample', 'promo', 'trailer', '.part', 'hdsector', 'bbebbb',
+                   'videoplayback', 'mp4u', '4000+', '.srt', '.nfo', '.txt',
+                   '.jpg', '.png')
     _looks_junk = any(h in _src_base for h in _junk_hints) or _src_size < 20_000_000
     if _looks_junk:
         logging.warning(
