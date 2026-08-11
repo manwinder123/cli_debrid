@@ -981,10 +981,20 @@ def create_symlink(source_path: str, dest_path: str, media_item_id: int = None, 
         _src_base = os.path.basename(source_path).lower()
     except OSError:
         _src_size, _src_base = 0, ''
-    _junk_hints = ('sample', 'promo', 'trailer', '.part', 'hdsector', 'bbebbb',
+    _junk_hints = ('sample', 'promo', 'trailer', 'hdsector', 'bbebbb',
                    'videoplayback', 'mp4u', '4000+', '.srt', '.nfo', '.txt',
                    '.jpg', '.png')
-    _looks_junk = any(h in _src_base for h in _junk_hints) or _src_size < 20_000_000
+    # Name hints apply ONLY to tag-free filenames: "s04e01 - Trailer Travis"
+    # is a legit episode whose TITLE contains "trailer", and "greys...s04e10.
+    # part2" is a legit Blu-ray disc split (NOT a partial download). A plain
+    # "trailer.mkv" / "sample.mkv" / "RARBG.com.mp4" has no episode tag and is
+    # refused. The 20 MB floor below catches the rest regardless of naming.
+    _name_has_episode_tag = bool(
+        re.search(r"\bs\d{1,2}\s*[eE]\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|season\s+\d+", _src_base)
+    )
+    _looks_junk = (
+        not _name_has_episode_tag and any(h in _src_base for h in _junk_hints)
+    ) or _src_size < 20_000_000
     if _looks_junk:
         logging.warning(
             f"[MATCH-GUARD] Refusing symlink of suspicious source {source_path} "
