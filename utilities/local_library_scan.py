@@ -787,17 +787,33 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
         if imdb_id == 'tt0000000':
             imdb_id = ''
 
-        # Providers sometimes deliver the year embedded in the title
-        # (e.g. "Yellowstone (2018)") and the daily cleanup task only strips it
-        # on its next pass — so the "{title} ({year})" templates below would
-        # produce a duplicated-year folder ("Yellowstone (2018) (2018)") that
-        # Plex treats as a separate show. Strip a trailing " (YYYY)" here so
-        # symlink/DAS folder names never repeat the year.
-        _raw_title = str(item.get('title', 'Unknown'))
-        _title = re.sub(r'\s*\(\d{4}\)\s*$', '', _raw_title).strip() or _raw_title
+        # Local fix: strip a trailing " (YYYY)" so "{title} ({year})" templates
+        # never produce duplicated-year folders ("Show (2018) (2018)").
+        raw_title = str(item.get('title', 'Unknown'))
+        raw_title = re.sub(r'\s*\(\d{4}\)\s*$', '', raw_title).strip() or str(item.get('title', 'Unknown'))
+
+        # Upstream bf40677a: sanitize_filename ASCII-encodes and drops anything it
+        # cannot represent - for a title that is partly or entirely non-Latin script,
+        # that can strip it down to nothing (or a short, non-distinguishing fragment).
+        # Fall back to a stable unique identifier whenever the title contains any
+        # non-Latin script at all.
+        _non_latin_script = re.compile(
+            r'[' + '぀-ヿ'    # Hiragana + Katakana
+            + '㐀-䶿'  # CJK Extension A
+            + '一-鿿'  # CJK Unified Ideographs
+            + '가-힯]' # Hangul syllables
+        )
+        effective_title = raw_title
+        if raw_title and raw_title.strip() and _non_latin_script.search(raw_title):
+            effective_title = imdb_id or item.get('tmdb_id', '') or 'unknown'
+            logging.warning(
+                f"[SymlinkPath] Title {raw_title!r} has no ASCII-safe representation - "
+                f"falling back to {effective_title!r} to avoid colliding with other "
+                f"items released in {item.get('year', '')!r}"
+            )
 
         template_vars = {
-            'title': _title,
+            'title': effective_title,
             'year': item.get('year', ''),
             'imdb_id': imdb_id,
             'tmdb_id': item.get('tmdb_id', ''),
