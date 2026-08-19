@@ -308,10 +308,8 @@ def get_wanted_from_overseerr(versions: Dict[str, bool]) -> List[Tuple[List[Dict
                     request_id = item.get('id')  # Overseerr's request ID
                     tmdb_id = media.get('tmdbId')
 
-                    # Debug logging for ALL requests to see what we're getting
-                    logging.info(f"DEBUG Overseerr: Request {request_id} (TMDB: {tmdb_id}) - requestedBy: {requested_by}")
-                    logging.info(f"DEBUG Overseerr: Extracted requester_display_name: {repr(requester_display_name)}")
-
+                    # Debug logging for requests (redacted to avoid PII in logs)
+                    logging.debug(f"Overseerr: Request {request_id} (TMDB: {tmdb_id}) requester={repr(requester_display_name)}")
                     wanted_item = {
                         'tmdb_id': media.get('tmdbId'),
                         'media_type': media.get('mediaType'),
