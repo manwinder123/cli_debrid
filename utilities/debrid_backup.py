@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import time
+import threading
 from typing import Dict, List, Optional
 
 _LOG_TAG = '[DEBRID_BACKUP]'
@@ -1117,11 +1118,16 @@ def _cleanup_rd(api_key: str, settings: dict) -> dict:
                 headers=headers, timeout=15
             )
             logging.info(f'{_LOG_TAG} Deleted RD torrent {torrent_id} ({reason}) — {r.status_code}')
-            time.sleep(0.1)
             return True
         except Exception as e:
             logging.warning(f'{_LOG_TAG} Failed to delete {torrent_id}: {e}')
             return False
+
+    # Deletions are independent RD API calls — collect candidates and fire
+    # them concurrently instead of serial + sleep (a post-restart duplicate
+    # wave can be thousands of torrents; serial took ~50 minutes and starved
+    # the event loop / web API).
+    _rd_candidates: list = []  # (torrent_id, reason, bucket)
 
     def _parse_added(added_str: str) -> float:
         """Parse RD added timestamp string to unix ts."""
@@ -1134,8 +1140,7 @@ def _cleanup_rd(api_key: str, settings: dict) -> dict:
     surviving = []
     for t in torrents:
         if delete_errors and _is_error_status(t.get('status', '')):
-            if _rd_delete(t['id'], 'error status'):
-                deleted_errors.append(t['id'])
+            _rd_candidates.append((t['id'], 'error status', 'errors'))
             continue
         surviving.append(t)
 
@@ -1146,8 +1151,7 @@ def _cleanup_rd(api_key: str, settings: dict) -> dict:
             if t.get('progress', -1) == 0:
                 added_ts = _parse_added(t.get('added', ''))
                 if added_ts and (now - added_ts) > stalled_cutoff:
-                    if _rd_delete(t['id'], f'stalled {stalled_days}d'):
-                        deleted_stalled.append(t['id'])
+                    _rd_candidates.append((t['id'], f'stalled {stalled_days}d', 'stalled'))
                     continue
             still_surviving.append(t)
         surviving = still_surviving
@@ -1178,11 +1182,27 @@ def _cleanup_rd(api_key: str, settings: dict) -> dict:
                 to_del = copies[1:]
 
             for t in to_del:
-                if _rd_delete(t['id'], 'duplicate'):
-                    deleted_dupes.append(t['id'])
+                _rd_candidates.append((t['id'], 'duplicate', 'dupes'))
+
+    # Fire all deletions concurrently (RD tolerates parallel DELETE bursts;
+    # this turns the ~50-minute serial storm into ~1-2 minutes).
+    if _rd_candidates:
+        from concurrent.futures import ThreadPoolExecutor
+        _buckets = {'errors': deleted_errors, 'stalled': deleted_stalled, 'dupes': deleted_dupes}
+        _lock = threading.Lock()
+
+        def _rd_delete_one(cand):
+            tid, reason, bucket = cand
+            ok = _rd_delete(tid, reason)
+            if ok:
+                with _lock:
+                    _buckets[bucket].append(tid)
+            return ok
+
+        with ThreadPoolExecutor(max_workers=5) as _ex:
+            list(_ex.map(_rd_delete_one, _rd_candidates))
 
     total = len(deleted_errors) + len(deleted_dupes) + len(deleted_stalled)
-
     # Write last_cleanup to log
     log = _read_log()
     log['last_cleanup'] = now

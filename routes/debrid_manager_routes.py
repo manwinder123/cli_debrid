@@ -3294,10 +3294,13 @@ def api_nas_adopt_run():
 @debrid_manager_bp.route('/api/reconcile/bulk_requeue', methods=['POST'])
 @admin_required
 def api_reconcile_bulk_requeue():
-    """Move a list of media item IDs back to Wanted state for re-scraping."""
+    """Move a list of media item IDs back to Wanted (or Unreleased) for re-scraping."""
     from database.core import get_db_connection
     data = request.get_json(silent=True) or {}
     item_ids = data.get('item_ids', [])
+    target_state = data.get('target_state', 'Wanted')
+    if target_state not in ('Wanted', 'Unreleased'):
+        return jsonify({'success': False, 'error': 'target_state must be Wanted or Unreleased'}), 400
     if not item_ids or not isinstance(item_ids, list):
         return jsonify({'success': False, 'error': 'item_ids required'}), 400
     try:
@@ -3306,9 +3309,10 @@ def api_reconcile_bulk_requeue():
         for iid in item_ids:
             try:
                 conn.execute(
-                    "UPDATE media_items SET state='Wanted', filled_by_torrent_id=NULL,"
+                    f"UPDATE media_items SET state='{target_state}', filled_by_torrent_id=NULL,"
                     " filled_by_magnet=NULL, filled_by_file=NULL, filled_by_title=NULL,"
-                    " scrape_results=NULL WHERE id=? AND state='Collected'",
+                    " scrape_results=NULL, location_on_disk=NULL, collected_at=NULL"
+                    " WHERE id=? AND state IN ('Collected','Checking','Scraping')",
                     (int(iid),)
                 )
                 updated += conn.execute("SELECT changes()").fetchone()[0]
@@ -3318,7 +3322,7 @@ def api_reconcile_bulk_requeue():
         conn.close()
         # Invalidate reconcile cache
         _reconcile_cache['data'] = None
-        return jsonify({'success': True, 'updated': updated})
+        return jsonify({'success': True, 'updated': updated, 'target_state': target_state})
     except Exception as e:
         logging.error(f"[Reconcile] bulk_requeue error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3468,6 +3472,65 @@ def api_reconcile_bulk_delete_db():
     except Exception as e:
         logging.error(f"[Reconcile] bulk_delete_db error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@debrid_manager_bp.route('/api/reconcile/fix_paths', methods=['POST'])
+@admin_required
+def api_reconcile_fix_paths():
+    """Fix stale location_on_disk for Collected items whose file now lives in DAS.
+
+    Body: {"fixes": [{"item_id": int, "file_path": "/mnt/das_pool/..."}]}
+    Only updates Collected rows where the target file exists. Used by
+    reconcile_stuck_items.py to correct the 4k+ stale symlink paths without
+    requeueing/re-collecting.
+    """
+    from database.core import get_db_connection
+    import os as _os
+    data = request.get_json(silent=True) or {}
+    fixes = data.get('fixes', [])
+    if not fixes or not isinstance(fixes, list):
+        return jsonify({'success': False, 'error': 'fixes[] required'}), 400
+    try:
+        conn = get_db_connection()
+        updated = 0
+        errors = []
+        for entry in fixes:
+            try:
+                iid = int(entry.get('item_id'))
+                fp = (entry.get('file_path') or '').strip()
+                if not fp:
+                    errors.append({'item_id': iid, 'error': 'file_path required'})
+                    continue
+                # Validate path is inside DAS or placeholder — don't allow arbitrary FS writes
+                if not (fp.startswith('/mnt/das_pool/') or fp.startswith('/mnt/plexdrive/')):
+                    errors.append({'item_id': iid, 'error': 'file_path must be inside DAS'})
+                    continue
+                # Verify file actually exists (avoid fixing to a missing file)
+                if not _os.path.exists(fp):
+                    errors.append({'item_id': iid, 'error': 'target file not found'})
+                    continue
+                cur = conn.execute("SELECT id, state FROM media_items WHERE id=?", (iid,))
+                row = cur.fetchone()
+                if not row:
+                    errors.append({'item_id': iid, 'error': 'not found'})
+                    continue
+                # Allow fixing any state but primarily Collected; log otherwise
+                conn.execute(
+                    "UPDATE media_items SET location_on_disk=?, original_path_for_symlink=?, location_basename=? WHERE id=?",
+                    (fp, fp, _os.path.basename(fp), iid),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    updated += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append({'item_id': entry.get('item_id'), 'error': str(exc)})
+        conn.commit()
+        conn.close()
+        _reconcile_cache['data'] = None
+        return jsonify({'success': True, 'updated': updated, 'errors': errors})
+    except Exception as e:
+        logging.error(f"[Reconcile] fix_paths error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 
 # ---------------------------------------------------------------------------

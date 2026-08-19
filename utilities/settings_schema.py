@@ -472,6 +472,22 @@ SETTINGS_SCHEMA = {
             "description": "Priority order for content sources in the scraping queue (comma-separated list). Content sources not listed will be processed last.",
             "default": ""
         },
+        "prioritize_never_failed": {
+            "type": "boolean",
+            "description": "Process Wanted items that have never been blacklisted (fresh adds / never scraped) before items that previously blacklisted with zero results. Failed items still retest on the blacklist cycle — they just queue last.",
+            "default": False
+        },
+        "idle_unblacklist_threshold": {
+            "type": "integer",
+            "description": "When the Wanted count is at or below this number, unblacklist items early (before blacklist_duration) to keep the pipeline busy. 0 = only when the queue is empty; -1 disables the backfill.",
+            "default": 0
+        },
+        "idle_unblacklist_min_age_days": {
+            "type": "integer",
+            "description": "Minimum time an item must stay blacklisted before the idle backfill can retest it. Prevents hot re-churn of items that just blacklisted.",
+            "default": 3,
+            "min": 1
+        },
         "wake_limit": {
             "type": "string",
             "description": "Number of times to wake items before blacklisting",

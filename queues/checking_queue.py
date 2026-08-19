@@ -584,6 +584,31 @@ class CheckingQueue:
         try:
             status_result = self.debrid_provider.get_torrent_info_with_status(torrent_id)
 
+            # The primary provider 404s torrents that live on a fallback
+            # provider (e.g. a TorBox pack assigned via manual assignment,
+            # while RD is primary). Check every fallback before declaring
+            # the torrent missing — otherwise the check queue resets good
+            # items to Wanted and the pipeline re-scrapes redundant
+            # season torrents instead of using the existing pack.
+            if status_result.status == TorrentFetchStatus.NOT_FOUND:
+                try:
+                    from debrid import get_debrid_providers as _gdp
+                    _providers = _gdp()
+                    for _fb in _providers[1:]:
+                        try:
+                            _fb_res = _fb.get_torrent_info_with_status(torrent_id)
+                        except Exception as _fbe:
+                            continue
+                        if _fb_res.status == TorrentFetchStatus.OK:
+                            status_result = _fb_res
+                            logging.info(
+                                f"Torrent {torrent_id} not on primary provider; "
+                                f"found on fallback {getattr(_fb, 'name', _fb.__class__.__name__)}."
+                            )
+                            break
+                except Exception as _fbl:
+                    logging.debug(f"Fallback torrent lookup skipped: {_fbl}")
+
             if status_result.status == TorrentFetchStatus.OK:
                 if isinstance(status_result.data, dict):
                     progress = status_result.data.get('progress', 0)
@@ -596,7 +621,7 @@ class CheckingQueue:
                     return progress
                 return 0
             elif status_result.status == TorrentFetchStatus.NOT_FOUND:
-                logging.info(f"Torrent {torrent_id} confirmed NOT FOUND (404) by provider.")
+                logging.info(f"Torrent {torrent_id} confirmed NOT FOUND (404) by all providers.")
                 return PROGRESS_RESULT_MISSING
             # New block to catch 404s hidden in error messages
             elif status_result.message and "404" in status_result.message and \

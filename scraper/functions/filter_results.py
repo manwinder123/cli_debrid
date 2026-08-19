@@ -129,7 +129,8 @@ def filter_results(
     # Determine content type specific settings
     is_movie = content_type.lower() == 'movie'
     is_episode = content_type.lower() == 'episode'
-    is_anime = genres and any('anime' in g.lower() for g in genres)
+    from utilities.media_category import genres_contain_anime
+    is_anime = genres_contain_anime(genres)
     is_ufc = False
     
     # Pre-normalize query title and aliases

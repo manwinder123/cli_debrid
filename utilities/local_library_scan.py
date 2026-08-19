@@ -754,7 +754,8 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
                     logging.info(f"[SymlinkPath] Using user-selected type folder: '{folder_name_for_type}' (manual selection overrides genre-based auto-detection)")
                 else:
                     # Determine content type based on genres (auto-detection)
-                    is_anime = any('anime' in genre.lower() for genre in parsed_genres_list)
+                    from utilities.media_category import genres_contain_anime
+                    is_anime = genres_contain_anime(parsed_genres_list)
                     is_documentary = any('documentary' in genre.lower() for genre in parsed_genres_list)
 
                     folder_name_for_type = ""
@@ -863,7 +864,8 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
                     genres_for_anime_check = [g.strip() for g in genres_for_anime_check.split(',') if g.strip()]
             if not isinstance(genres_for_anime_check, list):
                 genres_for_anime_check = [str(genres_for_anime_check)]
-            is_anime_for_rename = any('anime' in genre.lower() for genre in genres_for_anime_check)
+            from utilities.media_category import genres_contain_anime
+            is_anime_for_rename = genres_contain_anime(genres_for_anime_check)
 
             # anidb_metadata_used = False
             # if get_setting('Debug', 'anime_renaming_using_anidb', False) and is_anime_for_rename and not skip_jikan_lookup:
@@ -1292,6 +1294,37 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
         try:
             if not item.get('filled_by_file'):
                 return False
+
+            # DAS guard: if file already exists in DAS library (transcoded), don't re-link from Zurg
+            # This prevents cli_debrid from re-creating symlinks for media already in DAS, which would cause Tdarr 'Not Required' jobs
+            try:
+                _das_check_file = item.get('filled_by_file')
+                if _das_check_file:
+                    _sym_path = get_symlink_path(item, _das_check_file)
+                    if _sym_path:
+                        from pathlib import Path as _P
+                        _sp = _P(_sym_path)
+                        _parts = _sp.parts
+                        if "symlinks" in _parts:
+                            _root_idx = _parts.index("symlinks")
+                            _tree = _parts[_root_idx+1] if len(_parts) > _root_idx+1 else ""
+                            _DAS_MAP = {
+                                "shows": "/mnt/das_pool/tv-shows-plex-drive",
+                                "movies": "/mnt/das_pool/movies-plex-drive",
+                                "anime tv shows": "/mnt/das_pool/anime-tv-shows-plex-drive",
+                                "anime movies": "/mnt/das_pool/anime-movies-plex-drive",
+                                "tv shows tdarr": "/mnt/das_pool/tv-shows-plex-drive",
+                                "movies tdarr": "/mnt/das_pool/movies-plex-drive",
+                            }
+                            _das_root = _DAS_MAP.get(_tree)
+                            if _das_root:
+                                _rel = _P(*_parts[_root_idx+2:])
+                                _das_path = _P(_das_root) / _rel
+                                if _das_path.exists():
+                                    logging.info(f"[DAS-GUARD] Item {item.get('id')} already in DAS: {_das_path}, skipping Zurg link (prevents Tdarr Not Required)")
+                                    return True
+            except Exception as _e_das:
+                logging.debug(f"DAS guard check failed for {item.get('id')}: {_e_das}")
 
             original_path = get_setting('File Management', 'original_files_path')
 

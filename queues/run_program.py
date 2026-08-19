@@ -168,7 +168,7 @@ class ProgramRunner:
             from metadata.metadata import _get_local_timezone # Added import
             tz = _get_local_timezone()
             logging.info(f"Initializing APScheduler with timezone: {tz.key}")
-            _queue_workers = max(1, min(3, int(get_setting('Queue', 'queue_pool_workers', 2))))
+            _queue_workers = max(1, min(6, int(get_setting('Queue', 'queue_pool_workers', 6))))
             executors = {
                 'default': ThreadPoolExecutor(max_workers=1),  # scheduled/maintenance tasks — sequential
                 'queue': ThreadPoolExecutor(max_workers=_queue_workers),
@@ -182,7 +182,7 @@ class ProgramRunner:
             logging.info(f"APScheduler configured with separate thread pools: queue({_queue_workers}) and default(1).")
         except Exception as e:
             logging.error(f"Failed to get local timezone for scheduler, using system default: {e}")
-            _queue_workers = max(1, min(3, int(get_setting('Queue', 'queue_pool_workers', 2))))
+            _queue_workers = max(1, min(6, int(get_setting('Queue', 'queue_pool_workers', 6))))
             executors = {
                 'default': ThreadPoolExecutor(max_workers=1),
                 'queue': ThreadPoolExecutor(max_workers=_queue_workers),
@@ -270,7 +270,7 @@ class ProgramRunner:
             'Sleeping': 300,
             'Unreleased': 300,
             'Blacklisted': 7200,
-            'Pending Uncached': 3600,
+            'Pending Uncached': 300,
             'Upgrading': 3600,
             'final_check_queue': 900, # Use lowercase key matching the task ID
             'Pre_release': 24 * 60 * 60, # Run every 24 hours (daily)
@@ -1410,7 +1410,7 @@ class ProgramRunner:
             logging.debug(f'[Heartbeat] Watchdog error: {_wd_err}')
 
         # Scraping-queue stuck detector: if the in-memory Scraping queue has been at the
-        # same size >= WANTED_THROTTLE_SCRAPING_SIZE (100) for more than 10 minutes without
+        # same size >= WANTED_THROTTLE_SCRAPING_SIZE (400) for more than 10 minutes without
         # any items being moved out, force-sync by moving all stale items back to Wanted
         # so the throttle releases and the system recovers without a restart.
         try:
@@ -10266,7 +10266,7 @@ def _setup_scheduler_listeners(runner_instance):
             logging.error(f"[_setup_scheduler_listeners] Failed to get local timezone for scheduler, using UTC fallback: {e_tz}")
             tz = pytz.utc
 
-        _queue_workers = max(1, min(3, int(get_setting('Queue', 'queue_pool_workers', 2))))
+        _queue_workers = max(1, min(6, int(get_setting('Queue', 'queue_pool_workers', 6))))
         executors = {
             'default': ThreadPoolExecutor(max_workers=1),
             'queue': ThreadPoolExecutor(max_workers=_queue_workers),

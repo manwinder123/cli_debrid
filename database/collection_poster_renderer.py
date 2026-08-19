@@ -1198,7 +1198,10 @@ def generate_preview_images():
     # Use the app's own plexcollection.png as the default preview
     default_src = STATIC_DIR / 'image' / 'plexcollection.png'
     if not default_src.exists():
-        default_src = Path('/home/mash2k3/Documents/Projects/Tangerine_CLI/posters/transcode.jpeg')
+        # Fallback: allow override via $POSTER_FALLBACK_PATH (e.g. custom
+        # transcode image), otherwise use generic placeholder path.
+        _fb = os.environ.get("POSTER_FALLBACK_PATH")
+        default_src = Path(_fb) if _fb else Path("/tmp/transcode.jpeg")
     if default_src.exists():
         from PIL import Image as _Image
         _img = _Image.open(str(default_src))

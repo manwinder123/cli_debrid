@@ -120,6 +120,9 @@ def migrate_schema():
         if 'blacklisted_date' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN blacklisted_date TIMESTAMP')
             logging.info("Successfully added blacklisted_date column to media_items table.")
+        if 'blacklist_count' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN blacklist_count INTEGER NOT NULL DEFAULT 0')
+            logging.info("Successfully added blacklist_count column to media_items table.")
         if 'location_on_disk' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN location_on_disk TEXT')
             logging.info("Successfully added location_on_disk column to media_items table.")
@@ -279,6 +282,12 @@ def migrate_schema():
         if 'debrid_folder_name' not in columns:
             conn.execute('ALTER TABLE media_items ADD COLUMN debrid_folder_name TEXT')
             logging.info("Successfully added debrid_folder_name column to media_items table.")
+        if 'rd_infringing' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN rd_infringing BOOLEAN DEFAULT FALSE')
+            logging.info("Successfully added rd_infringing column to media_items table.")
+        if 'rd_infringing_hash' not in columns:
+            conn.execute('ALTER TABLE media_items ADD COLUMN rd_infringing_hash TEXT')
+            logging.info("Successfully added rd_infringing_hash column to media_items table.")
 
         # ============================================
         # Overlay System Tables
@@ -939,6 +948,7 @@ def create_tables():
                 alternate_title TEXT,
                 upgrading_from TEXT,
                 blacklisted_date TIMESTAMP,
+                blacklist_count INTEGER NOT NULL DEFAULT 0,
                 upgraded BOOLEAN DEFAULT FALSE,
                 location_on_disk TEXT,
                 early_release BOOLEAN DEFAULT FALSE,
@@ -986,8 +996,11 @@ def create_tables():
                 verification_failed BOOLEAN DEFAULT FALSE,
                 verification_failure_reason TEXT,
                 plex_labels_last_synced TIMESTAMP,
+                selected_folder TEXT,
                 debrid_folder_name TEXT,
-                source_position INTEGER
+                source_position INTEGER,
+                rd_infringing BOOLEAN DEFAULT FALSE,
+                rd_infringing_hash TEXT
             )
         ''')
 

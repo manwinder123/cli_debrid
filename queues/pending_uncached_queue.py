@@ -136,6 +136,22 @@ class PendingUncachedQueue:
         ]
 
         if not parsed_torrent_files:
+            # Torrent accepted but file list still populating (TorBox metaDL /
+            # queued after an uncached add). Keep the item in this queue — the
+            # next pass re-checks and moves it to Checking once files appear.
+            # Only fail back to Wanted when the torrent is genuinely empty/dead.
+            _status = str(torrent_info.get('status') or torrent_info.get('download_state') or '').lower()
+            _pending = {
+                'metadl', 'meta_dl', 'meta_download', 'metadata', 'queued',
+                'downloading', 'checking', 'magnet_conversion',
+                'waiting_files_selection', 'unknown',
+            }
+            if _status in _pending:
+                logging.info(
+                    f"Torrent {torrent_id} for {item_identifier} still pending "
+                    f"(state={_status or 'unknown'}) — keeping item in Pending Uncached for next pass."
+                )
+                return  # stay in queue; process() iterates next tick
             logging.debug(f"No valid video files found in torrent for {item_identifier} after parsing.")
             self._handle_failed_add(item, queue_manager)
             return

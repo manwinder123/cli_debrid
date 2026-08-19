@@ -105,12 +105,54 @@ class BlacklistedQueue:
 
             items_to_unblacklist = [dict(row) for row in items_to_unblacklist_rows]
 
+            # --- Idle backfill ---
+            # If nothing reached the full blacklist_duration cutoff AND the
+            # Wanted queue is (near) empty, unblacklist older items early so
+            # the pipeline never sits idle. Least-failed first; a minimum age
+            # floor keeps recently-blacklisted items from hot re-churning.
             if not items_to_unblacklist:
-                if release_date_cutoff:
-                    logging.debug(f"No items found eligible for unblacklisting with release date cutoff {release_date_cutoff}.")
-                else:
-                    logging.debug("No items found eligible for unblacklisting.")
-                return
+                idle_threshold = int(get_setting("Queue", "idle_unblacklist_threshold", 0) or 0)
+                if idle_threshold >= 0:
+                    try:
+                        _conn_w = get_db_connection()
+                        wanted_count = _conn_w.execute(
+                            "SELECT COUNT(*) FROM media_items WHERE state = 'Wanted'"
+                        ).fetchone()[0]
+                        _conn_w.close()
+                    except Exception as _we:
+                        logging.warning(f"Idle backfill wanted-count check failed: {_we}")
+                        wanted_count = idle_threshold + 1  # conservative: skip backfill
+                    if wanted_count <= idle_threshold:
+                        min_age_days = max(1, int(get_setting("Queue", "idle_unblacklist_min_age_days", 3) or 3))
+                        idle_cutoff = current_time - timedelta(days=min_age_days)
+                        idle_query = """
+                            SELECT id, title, type, imdb_id, tmdb_id, season_number,
+                                   episode_number, version, blacklisted_date, release_date
+                            FROM media_items
+                            WHERE state = 'Blacklisted'
+                              AND blacklisted_date IS NOT NULL
+                              AND blacklisted_date <= ?
+                              AND (ghostlisted = FALSE OR ghostlisted IS NULL)
+                        """
+                        idle_params = [idle_cutoff.isoformat()]
+                        if release_date_cutoff:
+                            idle_query += " AND (release_date IS NULL OR release_date = 'Unknown' OR release_date >= ?)"
+                            idle_params.append(release_date_cutoff.isoformat())
+                        idle_query += " ORDER BY COALESCE(blacklist_count, 0) ASC, blacklisted_date ASC LIMIT 100"
+                        try:
+                            _conn_i = get_db_connection()
+                            idle_rows = _conn_i.execute(idle_query, idle_params).fetchall()
+                            _conn_i.close()
+                            items_to_unblacklist = [dict(row) for row in idle_rows]
+                        except Exception as _ie:
+                            logging.error(f"Idle backfill query failed: {_ie}", exc_info=True)
+                            items_to_unblacklist = []
+                        if items_to_unblacklist:
+                            logging.info(
+                                f"[IdleBackfill] Wanted={wanted_count} <= threshold {idle_threshold}: "
+                                f"unblacklisting {len(items_to_unblacklist)} items early "
+                                f"(blacklisted >= {min_age_days}d ago, least-failed first)."
+                            )
 
             if release_date_cutoff:
                 logging.info(f"Found {len(items_to_unblacklist)} items eligible for unblacklisting with release date cutoff {release_date_cutoff}.")

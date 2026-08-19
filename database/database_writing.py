@@ -505,11 +505,21 @@ def update_media_item(item_id: int, **kwargs):
 def update_blacklisted_date(item_id: int, blacklisted_date: datetime | None):
     conn = get_db_connection()
     try:
-        conn.execute('''
-            UPDATE media_items
-            SET blacklisted_date = ?, last_updated = ?
-            WHERE id = ?
-        ''', (blacklisted_date, datetime.now(), item_id))
+        if blacklisted_date is not None:
+            # Increment the fail counter only when blacklisting (not when the
+            # date is cleared on un-blacklist). Drives least-failed-first
+            # ordering of retry items in the wanted queue.
+            conn.execute('''
+                UPDATE media_items
+                SET blacklisted_date = ?, blacklist_count = blacklist_count + 1, last_updated = ?
+                WHERE id = ?
+            ''', (blacklisted_date, datetime.now(), item_id))
+        else:
+            conn.execute('''
+                UPDATE media_items
+                SET blacklisted_date = ?, last_updated = ?
+                WHERE id = ?
+            ''', (blacklisted_date, datetime.now(), item_id))
         conn.commit()
         logging.info(f"Updated blacklisted_date to {blacklisted_date} for item ID {item_id}")
         return True

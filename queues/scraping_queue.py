@@ -381,14 +381,18 @@ class ScrapingQueue:
                         # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] Evaluating standard release date logic. EarlyRelease={item_to_process.get('early_release', False)}, IsMagnetAssigned={is_magnet_assigned}")
                         pass
                     if item_to_process['release_date'] == 'Unknown':
-                        if str(item_id_being_processed) == DEBUG_ITEM_ID:
-                            # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] Release date is 'Unknown'. Moving to Unreleased.")
-                            pass
-                        logging.info(f"Item {item_identifier} has an unknown release date. Moving to Unreleased queue.")
-                        queue_manager.move_to_unreleased(item_to_process, "Scraping")
-                        processed_successfully_or_moved = True # Handled by move
-                        processed_count += 1
-                        # No return here, let finally handle removal check if needed
+                        if item_to_process.get('type') == 'episode':
+                            # Old content (DBZ Abridged, Elliot Moose, archive
+                            # shows) usually lacks episode-level dates. Parking
+                            # in Unreleased is a dead-end (Unreleased queue only
+                            # returns valid-future-date items) — proceed to scrape.
+                            logging.info(f"Episode {item_identifier} has an unknown release date — proceeding to scrape (old content).")
+                        else:
+                            logging.info(f"Item {item_identifier} has an unknown release date. Moving to Unreleased queue.")
+                            queue_manager.move_to_unreleased(item_to_process, "Scraping")
+                            processed_successfully_or_moved = True # Handled by move
+                            processed_count += 1
+                            # No return here, let finally handle removal check if needed
                 elif is_magnet_assigned:
                     logging.info(f"Processing Magnet Assigned item {item_identifier} regardless of release date")
                 elif item_to_process.get('early_release', False): # Existing early release logic
@@ -414,9 +418,14 @@ class ScrapingQueue:
                         if not processed_successfully_or_moved and not item_to_process.get('early_release', False) and not is_magnet_assigned:
                             release_date_str = item_to_process.get('release_date')
                             if release_date_str == 'Unknown':
-                                logging.info(f"Item {item_identifier} has an unknown release date. Moving to Unreleased queue.")
-                                queue_manager.move_to_unreleased(item_to_process, "Scraping")
-                                processed_successfully_or_moved = True
+                                if item_to_process.get('type') == 'episode':
+                                    # Same old-content rationale as above — don't
+                                    # dead-end Unknown-date episodes in Unreleased.
+                                    logging.info(f"Episode {item_identifier} has an unknown release date — proceeding to scrape (old content).")
+                                else:
+                                    logging.info(f"Item {item_identifier} has an unknown release date. Moving to Unreleased queue.")
+                                    queue_manager.move_to_unreleased(item_to_process, "Scraping")
+                                    processed_successfully_or_moved = True
                             else:
                                 release_date = datetime.strptime(release_date_str, '%Y-%m-%d').date()
                                 if release_date > today:
@@ -1119,7 +1128,15 @@ class ScrapingQueue:
                     )
 
 
-        is_anime = True if item.get('genres') and 'anime' in item['genres'] else False
+        from utilities.media_category import genres_contain_anime
+        _genres_anime = item.get('genres')
+        if isinstance(_genres_anime, str):
+            try:
+                import json as _json_ga
+                _genres_anime = _json_ga.loads(_genres_anime)
+            except Exception:
+                pass
+        is_anime = genres_contain_anime(_genres_anime)
         
         # For episodes, filter by exact season/episode match, considering XEM mapping
         if item['type'] == 'episode' and not is_multi_pack:
@@ -1413,7 +1430,8 @@ class ScrapingQueue:
 
                     # --- ANIME ABSOLUTE EPISODE MATCHING (similar to media_matcher.py) ---
                     # Check if this is anime content and we need to try absolute episode matching
-                    is_anime = item.get('genres') and any('anime' in g.lower() for g in item.get('genres', []))
+                    from utilities.media_category import genres_contain_anime
+                    is_anime = genres_contain_anime(item.get('genres'))
                     if is_anime and not season_match and not episode_match and target_season is not None and target_episode is not None:
                         try:
                             # Get season episode counts for absolute episode calculation

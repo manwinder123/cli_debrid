@@ -14,7 +14,7 @@ from utilities.local_library_scan import check_local_file_in_nas_paths
 # Define constants for queue size limits
 SCRAPING_QUEUE_MAX_SIZE = 500
 # New threshold to pause Wanted processing entirely
-WANTED_THROTTLE_SCRAPING_SIZE = 100
+WANTED_THROTTLE_SCRAPING_SIZE = 400
 
 class WantedQueue:
     def __init__(self):
@@ -256,7 +256,19 @@ class WantedQueue:
                 effective_release_date_to_parse = physical_release_date_str
                 log_release_type = "physical release"
             
-            if not is_magnet_assigned and (not effective_release_date_to_parse or str(effective_release_date_to_parse).lower() in ['unknown', 'none']):
+            _no_valid_date = (not effective_release_date_to_parse or str(effective_release_date_to_parse).lower() in ['unknown', 'none'])
+            if not is_magnet_assigned and _no_valid_date:
+                if item.get('type') == 'episode':
+                    # Episodes with unknown/None release dates are almost always
+                    # OLD content whose metadata lacks dates (e.g. DBZ Abridged,
+                    # Elliot Moose, fan/archive shows) — not upcoming releases.
+                    # Parking them in Unreleased is a dead-end: the Unreleased
+                    # queue only returns items with valid future dates, so they
+                    # would never be scraped again. Treat as scrape-ready; the
+                    # no-match two-strike bound blacklists genuinely unservable
+                    # items and the unblacklist retry re-checks them later.
+                    logging.info(f"[{item_identifier}] Episode has no valid {log_release_type} date — treating as scrape-ready (old content).")
+                    return {'status': 'scrape', 'item_data': item, 'message': f"{item_identifier} no valid date, scraping as old content."}
                 logging.debug(f"Item {item_identifier} has no valid {log_release_type} date. Moving to Unreleased.")
                 queue_manager.move_to_unreleased(item, "Wanted")
                 return {'status': 'unreleased', 'item_data': item, 'message': f"{item_identifier} moved to Unreleased (no valid {log_release_type} date)."}
@@ -265,6 +277,12 @@ class WantedQueue:
                     release_date = datetime.strptime(str(effective_release_date_to_parse), '%Y-%m-%d').date()
                 except ValueError:
                     if not is_magnet_assigned:
+                        if item.get('type') == 'episode':
+                            # Same old-content rationale as above: a malformed
+                            # episode date is a metadata gap, not an upcoming
+                            # release. Scrape it.
+                            logging.info(f"[{item_identifier}] Episode has invalid {log_release_type} date '{effective_release_date_to_parse}' — treating as scrape-ready (old content).")
+                            return {'status': 'scrape', 'item_data': item, 'message': f"{item_identifier} invalid date, scraping as old content."}
                         logging.warning(f"Invalid {log_release_type} date format for item {item_identifier}: {effective_release_date_to_parse}. Moving to Unreleased.")
                         queue_manager.move_to_unreleased(item, "Wanted")
                         return {'status': 'unreleased', 'item_data': item, 'message': f"{item_identifier} moved to Unreleased (invalid {log_release_type} date)."}
@@ -463,6 +481,17 @@ class WantedQueue:
             params = []
             order_by_clauses = []
             sort_order_type = get_setting("Queue", "queue_sort_order", "None")
+            # Fresh/never-tried items first, previously-blacklisted items last.
+            # Failed items still retest on their blacklist cycle — they just
+            # queue behind everything else inside that cycle, so the long
+            # tail never starves entirely. Default off; toggle in Queue settings.
+            prioritize_never_failed = get_setting("Queue", "prioritize_never_failed", False)
+            if prioritize_never_failed:
+                order_by_clauses.append(
+                    "CASE WHEN blacklisted_date IS NULL THEN 0 ELSE 1 END"
+                )
+                # Within the retry group, least-failed items first.
+                order_by_clauses.append("COALESCE(blacklist_count, 0) ASC")
             if sort_order_type == "Movies First":
                 order_by_clauses.append("CASE type WHEN 'movie' THEN 0 ELSE 1 END")
             elif sort_order_type == "Episodes First":
@@ -519,12 +548,21 @@ class WantedQueue:
                         type_priority = 0 if item.get('type') == 'movie' else 1
                     elif sort_order_type == "Episodes First":
                         type_priority = 0 if item.get('type') == 'episode' else 1
+
+                    # Primary key: never-blacklisted items before retry items
+                    # (same rule as the SQL ordering, re-applied here because
+                    # content_source_priority re-sorts candidates in memory).
+                    if prioritize_never_failed:
+                        never_failed_priority = 0 if not item.get('blacklisted_date') else 1
+                    else:
+                        never_failed_priority = 0
+                    fail_count = item.get('blacklist_count') or 0
                     
                     if sort_by_release_date:
                         release_date_val = item.get('release_date') or ''
-                        return (priority_index, type_priority, release_date_val, item.get('title', ''))
+                        return (never_failed_priority, fail_count, priority_index, type_priority, release_date_val, item.get('title', ''))
                     else:
-                        return (priority_index, type_priority, item.get('title', ''))
+                        return (never_failed_priority, fail_count, priority_index, type_priority, item.get('title', ''))
                 candidate_items.sort(key=get_source_priority_key)
 
             # 4. Process Candidate Items

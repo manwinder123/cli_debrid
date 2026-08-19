@@ -5,7 +5,27 @@ tv shows / anime movies / anime tv / documentary movies / documentary tv).
 Kept free of heavy imports so it can be unit-tested in isolation.
 """
 import json
+import re
 from typing import Any, Dict
+
+
+def genres_contain_anime(genres) -> bool:
+    """Word-boundary check: is 'anime' one of the genre words?
+
+    Must NOT substring-match 'Animation' — kids cartoons carry that genre and
+    were being misclassified as anime everywhere (relaxed matching, title
+    guard bypass, anime filter thresholds), which let unrelated releases
+    (e.g. 'Hit.Point.S01E04' for 'Angela Anaconda S01E04') through.
+    Accepts a list or a single string of genres.
+    """
+    if isinstance(genres, str):
+        genres = [genres]
+    if not genres:
+        return False
+    for g in genres:
+        if re.search(r'(?<![a-z0-9])anime(?![a-z0-9])', (g or '').lower()):
+            return True
+    return False
 
 
 def _genres(item: Dict[str, Any]) -> list:
@@ -33,7 +53,7 @@ def derive_is_anime(item: Dict[str, Any]) -> bool:
         flag = flag.strip().lower() in ('1', 'true', 'yes')
     if bool(flag):
         return True
-    return any('anime' in g for g in _genres(item))
+    return genres_contain_anime(_genres(item))
 
 
 def derive_is_documentary(item: Dict[str, Any]) -> bool:

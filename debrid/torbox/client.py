@@ -91,7 +91,7 @@ class TorboxProvider(DebridProvider):
         state = (info.get('download_state') or '').lower()
         if state in {'cached', 'completed', 'downloaded'} or info.get('cached') or info.get('download_finished'):
             return TorrentStatus.CACHED
-        if state in {'downloading', 'queued', 'meta_download', 'metadata', 'checking'} or info.get('active'):
+        if state in {'downloading', 'queued', 'meta_download', 'metadata', 'metadl', 'meta_dl', 'checking'} or info.get('active'):
             return TorrentStatus.DOWNLOADING
         if state in {'error', 'failed'}:
             return TorrentStatus.ERROR

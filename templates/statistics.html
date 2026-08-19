@@ -105,9 +105,27 @@
             <button id="refresh-library-size-btn" class="tb-refresh" title="Refresh Library Size"><i class="fas fa-rotate"></i></button>
         </div>
         <div class="tb-sep"></div>
+        <div class="tb-pill" id="local-stats-pill" title="Symlink tree vs NAS/DAS library (walked on demand)">
+            <i class="fas fa-hard-drive" style="color:var(--st-green, #7cc98a)"></i>
+            <span class="tb-label">Local:</span>
+            <span class="tb-val" id="local-stats-display">—</span>
+            <button id="refresh-local-stats-btn" class="tb-refresh" title="Refresh local library stats (walks symlinks + DAS, takes minutes)"><i class="fas fa-rotate"></i></button>
+        </div>
+        <div class="tb-sep"></div>
+        <div class="tb-pill" id="local-counts-pill" title="Library item counts (collected / total)">
+            <i class="fas fa-list" style="color:var(--st-blue)"></i>
+            <span class="tb-label">Counts:</span>
+            <span class="tb-val" id="local-counts-display">—</span>
+        </div>
         <div class="tb-pill">
             <i class="fas fa-globe" style="color:var(--st-blue)"></i>
             <span class="tb-val">{{ stats.timezone }}</span>
+        </div>
+        <div class="tb-break"></div>
+        <div class="tb-pill" id="das-counts-pill" title="Actual files on DAS pool (from last walk)" style="background: rgba(255,107,53,0.15); border: 1px solid rgba(255,107,53,0.3);">
+            <i class="fas fa-database" style="color:var(--st-accent)"></i>
+            <span class="tb-label">DAS:</span>
+            <span class="tb-val" id="das-counts-display" style="font-weight:600;">—</span>
         </div>
         <div class="tb-break"></div>
         <div class="tb-pill">
@@ -147,10 +165,42 @@
         </div>
       </div>
     </div>
-
+    <!-- Local walk progress bar -->
+    <div id="local-walk-progress" style="display:none; height:4px; background:#1a1a1a; border-radius:2px; margin:8px 0; overflow:hidden; border:1px solid #333;">
+        <div id="local-walk-progress-fill" style="height:100%; width:0%; background:linear-gradient(90deg, #ff6b35, #f7931e); transition:width 0.3s; animation: shimmer 1.5s infinite;"></div>
+    </div>
+    <div id="local-walk-status" style="display:none; text-align:center; font-size:0.85em; color:#ff6b35; margin:4px 0;"></div>
+    <style>@keyframes shimmer { 0% { opacity:0.7; } 50% { opacity:1; } 100% { opacity:0.7; } }</style>
+    <!-- DAS Pool Stats Card - Prominent display for das_pool file counts -->
+    <div class="stats-box" id="das-pool-stats-card" style="margin:12px 0; border:1px solid rgba(255,107,53,0.3); background:rgba(255,107,53,0.05);">
+        <h3 style="color:var(--st-accent); display:flex; align-items:center; gap:8px;">
+            <i class="fas fa-database"></i> DAS Pool (Actual Files on Disk)
+            <span id="das-stats-refresh-indicator" style="display:none; font-size:0.7em; color:#7cc98a; margin-left:8px;"><i class="fas fa-spinner fa-spin"></i> Scanning...</span>
+        </h3>
+        <div class="stat-items" style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-top:8px;">
+            <div class="stat-item" style="text-align:center; padding:8px; background:rgba(0,0,0,0.2); border-radius:4px;">
+                <div style="font-size:0.85em; color:#888;">Movies</div>
+                <div id="das-movies-count" style="font-size:1.4em; font-weight:600; color:#fff;">—</div>
+                <div id="das-movies-size" style="font-size:0.8em; color:#aaa;">—</div>
+            </div>
+            <div class="stat-item" style="text-align:center; padding:8px; background:rgba(0,0,0,0.2); border-radius:4px;">
+                <div style="font-size:0.85em; color:#888;">Shows</div>
+                <div id="das-shows-count" style="font-size:1.4em; font-weight:600; color:#fff;">—</div>
+                <div id="das-shows-size" style="font-size:0.8em; color:#aaa;">—</div>
+            </div>
+            <div class="stat-item" style="text-align:center; padding:8px; background:rgba(0,0,0,0.2); border-radius:4px;">
+                <div style="font-size:0.85em; color:#888;">Episodes</div>
+                <div id="das-episodes-count" style="font-size:1.4em; font-weight:600; color:#fff;">—</div>
+                <div id="das-episodes-size" style="font-size:0.8em; color:#aaa;">—</div>
+            </div>
+        </div>
+        <div style="text-align:center; margin-top:8px; font-size:0.75em; color:#666;">
+            <span id="das-stats-timestamp">Click refresh to scan</span>
+        </div>
+    </div>
     <script>
         // Initialize displays when page loads
-        document.addEventListener('DOMContentLoaded', function() {
+        function initMainStats() {
             // Check if on mobile
             if (window.innerWidth <= 768) {
                 // Add compact-view class to statistics-wrapper
@@ -298,8 +348,225 @@
                         });
                 });
             }
+            // --- Local Library Stats (symlink vs NAS/DAS; on-demand walk) ---
+            const localStatsBtn = document.getElementById('refresh-local-stats-btn');
+            const localStatsDisplay = document.getElementById('local-stats-display');
+            let localStatsTimer = null;
 
-        });
+            function localStatsPoll() {
+                const progressBar = document.getElementById('local-walk-progress');
+                const progressFill = document.getElementById('local-walk-progress-fill');
+                fetch('/statistics/api/local_library_stats')
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.status === 'computing') {
+                            const el = (d.elapsed_s !== null && d.elapsed_s !== undefined) ? ` (${Math.round(d.elapsed_s)}s)` : '';
+                            localStatsDisplay.textContent = `Walking…${el}`;
+                            if (progressBar) {
+                                progressBar.style.display = 'block';
+                                if (progressFill) {
+                                    const pct = Math.min(95, (d.elapsed_s || 0) * 2);
+                                    progressFill.style.width = pct + '%';
+                                }
+                            }
+                            localStatsTimer = setTimeout(localStatsPoll, 2000);
+                            return;
+                        }
+                        if (progressBar) {
+                            if (progressFill) progressFill.style.width = '100%';
+                            setTimeout(() => { if (progressBar) progressBar.style.display = 'none'; }, 800);
+                        }
+                        if (d.status === 'ready' && d.data) {
+                            const dd = d.data;
+                            localStatsDisplay.textContent =
+                                `Sym ${fmtSize(dd.symlink_shows_bytes || 0)} / DAS ${fmtSize(dd.das_shows_bytes || 0)}`;
+                            localStatsDisplay.title =
+                                `Symlink shows: ${fmtSize(dd.symlink_shows_bytes || 0)}\n` +
+                                `Symlink movies: ${fmtSize(dd.symlink_movies_bytes || 0)}\n` +
+                                `DAS shows: ${fmtSize(dd.das_shows_bytes || 0)}\n` +
+                                `DAS movies: ${fmtSize(dd.das_movies_bytes || 0)}\n` +
+                                `Episodes: ${dd.counts.episodes_collected}/${dd.counts.episodes_total}\n` +
+                                `Movies: ${dd.counts.movies_collected}/${dd.counts.movies_total}\n` +
+                                `Walked ${Math.round(d.elapsed_s || 0)}s`;
+                            // Also update DAS counts pill from the same data
+                            const dasDisplay = document.getElementById('das-counts-display');
+                            if (dasDisplay && dd.das_counts) {
+                                dasDisplay.textContent =
+                                    `Movies ${dd.das_counts.das_movies_files} files · Shows ${dd.das_counts.das_shows} · Episodes ${dd.das_counts.das_shows_files} files`;
+                            }
+                            stopLocalSpin();
+                            return;
+                        }
+                        localStatsDisplay.textContent = 'Click refresh';
+                        if (progressBar) progressBar.style.display = 'none';
+                        stopLocalSpin();
+                    })
+                    .catch(() => {
+                        localStatsDisplay.textContent = 'Error';
+                        if (progressBar) progressBar.style.display = 'none';
+                        stopLocalSpin();
+                    });
+            }
+
+            function fmtSize(bytes) {
+                if (!bytes) return '0 B';
+                const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+                let i = 0, n = bytes;
+                while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+                return n.toFixed(2) + ' ' + units[i];
+            }
+
+            function stopLocalSpin() {
+                if (localStatsBtn) {
+                    localStatsBtn.disabled = false;
+                    const ic = localStatsBtn.querySelector('i');
+                    if (ic) ic.classList.remove('fa-spin');
+                }
+            }
+
+            if (localStatsBtn && localStatsDisplay) {
+                localStatsBtn.addEventListener('click', function() {
+                    const ic = localStatsBtn.querySelector('i');
+                    if (ic) ic.classList.add('fa-spin');
+                    localStatsBtn.disabled = true;
+                    localStatsDisplay.textContent = 'Starting walk…';
+                    // Use GET with refresh param to avoid POST CSRF issues, fallback to POST
+                    fetch('/statistics/api/local_library_stats?refresh=1')
+                        .then(r => r.json())
+                        .then(() => {
+                            if (localStatsTimer) clearTimeout(localStatsTimer);
+                            localStatsPoll();
+                        })
+                        .catch(() => {
+                            // Fallback to POST if GET fails
+                            return fetch('/statistics/api/local_library_stats', {method: 'POST'})
+                                .then(() => {
+                                    if (localStatsTimer) clearTimeout(localStatsTimer);
+                                    localStatsPoll();
+                                });
+                        })
+                        .catch(() => { stopLocalSpin(); localStatsDisplay.textContent = 'Error — click to retry'; });
+                });
+                // Show cached value on load if available, with polling if computing
+                function initLocalStats() {
+                    fetch('/statistics/api/local_library_stats')
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.status === 'computing') {
+                                const el = (d.elapsed_s !== null && d.elapsed_s !== undefined) ? ` (${Math.round(d.elapsed_s)}s)` : '';
+                                localStatsDisplay.textContent = `Walking…${el}`;
+                                if (d.elapsed_s !== undefined) {
+                                    localStatsDisplay.title = `Walk started ${d.started_at}, elapsed ${Math.round(d.elapsed_s)}s`;
+                                }
+                                localStatsBtn.disabled = true;
+                                const ic = localStatsBtn.querySelector('i');
+                                if (ic) ic.classList.add('fa-spin');
+                                localStatsTimer = setTimeout(localStatsPoll, 3000);
+                            } else if (d.status === 'ready' && d.data) {
+                                const dd = d.data;
+                                localStatsDisplay.textContent =
+                                    `Sym ${fmtSize(dd.symlink_shows_bytes || 0)} / DAS ${fmtSize(dd.das_shows_bytes || 0)}`;
+                                localStatsDisplay.title =
+                                    `Symlink: ${fmtSize(dd.symlink_shows_bytes || 0)} shows + ${fmtSize(dd.symlink_movies_bytes || 0)} movies\n` +
+                                    `DAS: ${fmtSize(dd.das_shows_bytes || 0)} shows + ${fmtSize(dd.das_movies_bytes || 0)} movies\n` +
+                                    `Walked ${Math.round(d.elapsed_s || 0)}s`;
+                            } else {
+                                localStatsDisplay.textContent = 'Click refresh';
+                                localStatsDisplay.title = 'Walk the filesystem to measure Symlink vs DAS sizes (takes ~10s)';
+                            }
+                        })
+                        .catch(() => { localStatsDisplay.textContent = 'Click refresh'; });
+                }
+                initLocalStats();
+            }
+
+            // --- Local Library Counts (instant DB-backed row) + DAS file counts ---
+            const countsDisplay = document.getElementById('local-counts-display');
+            const dasCountsDisplay = document.getElementById('das-counts-display');
+            // New DAS card elements
+            const dasMoviesCountEl = document.getElementById('das-movies-count');
+            const dasMoviesSizeEl = document.getElementById('das-movies-size');
+            const dasShowsCountEl = document.getElementById('das-shows-count');
+            const dasShowsSizeEl = document.getElementById('das-shows-size');
+            const dasEpisodesCountEl = document.getElementById('das-episodes-count');
+            const dasEpisodesSizeEl = document.getElementById('das-episodes-size');
+            const dasTimestampEl = document.getElementById('das-stats-timestamp');
+            const dasRefreshIndicator = document.getElementById('das-stats-refresh-indicator');
+            function updateDasCardFromData(dd, elapsed) {
+                if (dasMoviesCountEl) dasMoviesCountEl.textContent = (dd.das_counts?.das_movies_files ?? 0).toLocaleString();
+                if (dasMoviesSizeEl) dasMoviesSizeEl.textContent = fmtSize(dd.das_movies_bytes || 0);
+                if (dasShowsCountEl) dasShowsCountEl.textContent = (dd.das_counts?.das_shows ?? 0).toLocaleString();
+                if (dasShowsSizeEl) dasShowsSizeEl.textContent = fmtSize(dd.das_shows_bytes || 0);
+                if (dasEpisodesCountEl) dasEpisodesCountEl.textContent = (dd.das_counts?.das_shows_files ?? 0).toLocaleString();
+                if (dasEpisodesSizeEl) dasEpisodesSizeEl.textContent = fmtSize(dd.das_shows_bytes || 0);
+                if (dasTimestampEl) {
+                    const ts = dd.completed_at ? new Date(dd.completed_at).toLocaleString() : 'just now';
+                    dasTimestampEl.textContent = `Last walk: ${ts} (${Math.round(elapsed || 0)}s)`;
+                }
+            }
+            function updateCountsDisplays() {
+                if (countsDisplay) {
+                    countsDisplay.textContent = 'Loading…';
+                    fetch('/statistics/api/library_counts')
+                        .then(r => {
+                            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                            return r.json();
+                        })
+                        .then(d => {
+                            countsDisplay.textContent =
+                                `Movies ${d.movies_collected}/${d.movies_total} · ` +
+                                `Episodes ${d.episodes_collected}/${d.episodes_total} · ` +
+                                `Shows ${d.shows_collected}/${d.shows_total}`;
+                            countsDisplay.title = `DB: ${d.movies_collected} movies, ${d.episodes_collected} episodes across ${d.shows_collected} shows`;
+                            // Also update DAS counts pill if available from same endpoint
+                            if (dasCountsDisplay && d.das_counts) {
+                                const dc = d.das_counts;
+                                if (dc.das_total_files > 0 || dc.das_shows > 0) {
+                                    dasCountsDisplay.textContent =
+                                        `Movies ${dc.das_movies_files} files · Shows ${dc.das_shows} · Episodes ${dc.das_shows_files} files`;
+                                    dasCountsDisplay.title = `Actual files on DAS pool`;
+                                } else if (d.has_das_cache === false) {
+                                    dasCountsDisplay.textContent = 'Click Local refresh';
+                                    dasCountsDisplay.title = 'Walk needed to count DAS files';
+                                }
+                            }
+                            // Update DAS card if we have file counts
+                            if (d.das_counts && d.das_counts.das_total_files > 0) {
+                                // Use cached DAS counts for immediate display, will be updated by local stats poll if fresher
+                                if (dasMoviesCountEl) dasMoviesCountEl.textContent = d.das_counts.das_movies_files.toLocaleString();
+                                if (dasShowsCountEl) dasShowsCountEl.textContent = d.das_counts.das_shows.toLocaleString();
+                                if (dasEpisodesCountEl) dasEpisodesCountEl.textContent = d.das_counts.das_shows_files.toLocaleString();
+                            }
+                        })
+                        .catch((e) => { 
+                            console.error('Counts fetch failed', e);
+                            countsDisplay.textContent = 'Error — retrying…';
+                            setTimeout(updateCountsDisplays, 3000);
+                        });
+                }
+                // Also try to get DAS counts from local stats cache for immediate display
+                if (dasCountsDisplay || dasMoviesCountEl) {
+                    fetch('/statistics/api/local_library_stats')
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.status === 'ready' && d.data && d.data.das_counts) {
+                                const dc = d.data.das_counts;
+                                if (dasCountsDisplay && !dasCountsDisplay.textContent.includes('files')) {
+                                    dasCountsDisplay.textContent =
+                                        `Movies ${dc.das_movies_files} files · Shows ${dc.das_shows} · Episodes ${dc.das_shows_files} files`;
+                                }
+                                if (dasMoviesCountEl) updateDasCardFromData(d.data, d.elapsed_s);
+                            }
+                        }).catch(() => {});
+                }
+            }
+            updateCountsDisplays();
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initMainStats);
+        } else {
+            initMainStats();
+        }
 
         document.getElementById('time-format-toggle').addEventListener('change', function() {
             const isChecked = this.checked;

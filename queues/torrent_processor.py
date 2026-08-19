@@ -15,6 +15,39 @@ import hashlib
 import inspect
 from datetime import datetime, timedelta
 
+def _get_torbox_freeze_paths():
+    """Return TorBox freeze file candidates without hardcoding host username.
+
+    Priority:
+      1. $TORBOX_FREEZE_PATHS (colon-separated, e.g. "/host/.torbox_freeze:/user/config/.torbox_freeze")
+      2. $QUICKSTACK_DIR/.torbox_freeze if set (host dir mounted into container)
+      3. Generic container paths: /user/config/.torbox_freeze, /tmp/.torbox_freeze
+      4. Legacy host path (e.g. ~/quickstack/.torbox_freeze) (lowest priority,
+         deprecated — kept for one release to avoid silent unenforce)
+    """
+    env = os.environ.get("TORBOX_FREEZE_PATHS")
+    if env:
+        return [p.strip() for p in env.split(":") if p.strip()]
+    paths: list[str] = []
+    qd = os.environ.get("QUICKSTACK_DIR") or os.environ.get("QUICKSTACK_HOST_DIR")
+    if qd:
+        paths.append(os.path.join(qd, ".torbox_freeze"))
+    # Generic, username-free container locations (bind-mounted from host via
+    # quickstack/docker-compose.yml as ./.torbox_freeze:/tmp/.torbox_freeze etc.)
+    paths.extend(["/user/config/.torbox_freeze", "/tmp/.torbox_freeze"])
+    # Legacy fallback — check expanduser variant (e.g. ~/quickstack/.torbox_freeze)
+    # for users with old compose that still mounts host file to legacy container
+    # path. No hardcoded username — expanduser resolves dynamically.
+    legacy = os.path.expanduser("~/quickstack/.torbox_freeze")
+    if legacy not in paths:
+        paths.append(legacy)
+        try:
+            if os.path.exists(legacy):
+                logging.warning(f"[TorBoxFreeze] Using legacy path {legacy} — please update compose to mount ./.torbox_freeze:/tmp/.torbox_freeze and set TORBOX_FREEZE_PATHS or QUICKSTACK_DIR")
+        except Exception:
+            pass
+    return paths
+
 from debrid import get_debrid_providers
 from debrid.base import DebridProvider, TooManyDownloadsError, ProviderUnavailableError
 from debrid.common import (
@@ -399,7 +432,7 @@ class TorrentProcessor:
             logging.error(f"Error checking cache: {str(e)}", exc_info=True)
             return None
         
-    def add_to_account(self, magnet_or_url: str) -> Optional[Dict]:
+    def add_to_account(self, magnet_or_url: str, item: Optional[Dict] = None) -> Optional[Dict]:
         """Add a magnet/torrent to the debrid account, trying each provider in order.
 
         Tries the primary provider first with 429 retry logic.
@@ -422,8 +455,42 @@ class TorrentProcessor:
 
             providers = self._providers
             last_error = None
+            # TorBox freeze — skip TorBox when usage-window file exists.
+            # File location is configurable via $TORBOX_FREEZE_PATHS or
+            # $QUICKSTACK_DIR/.torbox_freeze; defaults are generic container
+            # paths (/user/config, /tmp) to avoid hardcoding host username.
+            _freeze_paths = _get_torbox_freeze_paths()
+            _freeze_path = _freeze_paths[0] if _freeze_paths else "/tmp/.torbox_freeze"
+            _freeze_active = False
+            _active_freeze_file = None
+            try:
+                import os as _os_f, datetime as _dt_f
+                for _candidate in _freeze_paths:
+                    if _os_f.path.exists(_candidate):
+                        _freeze_path = _candidate
+                        try:
+                            _exp = open(_candidate).read().strip().split()[0]
+                            _exp_d = _dt_f.date.fromisoformat(_exp)
+                            if _exp_d >= _dt_f.date.today():
+                                _freeze_active = True
+                                _active_freeze_file = _candidate
+                                break
+                            else:
+                                try: _os_f.remove(_candidate)
+                                except Exception: pass
+                        except Exception:
+                            _freeze_active = True
+                            _active_freeze_file = _candidate
+                            break
+            except Exception:
+                _freeze_active = False
 
             for provider in providers:
+                if _freeze_active and "torbox" in provider.PROVIDER_NAME.lower():
+                    _log_path = _active_freeze_file or _freeze_path
+                    logging.info(f"[add_to_account] Skipping {provider.PROVIDER_NAME} — TorBox freeze active ({_log_path} present).")
+                    last_error = "TorBox frozen (usage window)"
+                    continue
                 torrent_id = None
                 info = None
                 add_max_retries = 3
@@ -447,6 +514,43 @@ class TorrentProcessor:
                         if "451" in err_str:
                             logging.warning(f"[{provider.PROVIDER_NAME}] 451 DMCA block — trying next provider.")
                             last_error = f"451 DMCA ({provider.PROVIDER_NAME})"
+                            # Mark RD infringing: persist hash as bad-source so
+                            # future scrapes skip this infringing torrent on RD
+                            # and flag the media item for TorBox retry after freeze.
+                            try:
+                                _h = None
+                                if magnet:
+                                    _h = extract_hash_from_magnet(magnet)
+                                elif temp_file:
+                                    _h = extract_hash_from_file(temp_file)
+                                if _h:
+                                    _h_lower = str(_h).lower()
+                                    try:
+                                        from database.bad_sources import mark_bad_source as _mbs_rd
+                                        _mbs_rd(_h_lower, "rd_infringing")
+                                    except Exception:
+                                        pass
+                                    if item and item.get('id') and "real" in provider.PROVIDER_NAME.lower():
+                                        try:
+                                            from database.core import get_db_connection as _gdb_rd
+                                            _conn_rd = _gdb_rd()
+                                            try:
+                                                _conn_rd.execute("UPDATE media_items SET rd_infringing=1, rd_infringing_hash=? WHERE id=?", (_h_lower, item['id']))
+                                                _conn_rd.commit()
+                                            finally:
+                                                try:
+                                                    _conn_rd.close()
+                                                except Exception:
+                                                    pass
+                                            logging.info(f"[{provider.PROVIDER_NAME}] Marked item {item.get('id')} as rd_infringing hash={_h_lower}")
+                                        except Exception as _e_rd:
+                                            try:
+                                                from database.database_writing import update_media_item as _umi_rd
+                                                _umi_rd(item['id'], rd_infringing=True, rd_infringing_hash=_h_lower)
+                                            except Exception:
+                                                logging.debug(f"Failed to set rd_infringing for {item.get('id')}: {_e_rd}")
+                            except Exception as _mark_e:
+                                logging.debug(f"rd_infringing marking failed: {_mark_e}")
                             break  # Skip remaining retries, move to next provider
                         elif "429" in err_str and attempt < add_max_retries - 1:
                             wait_time = add_retry_delay_seconds * (2 ** attempt)
@@ -457,8 +561,15 @@ class TorrentProcessor:
                             last_error = err_str
                             break
                     except Exception as ex:
-                        logging.error(f"[{provider.PROVIDER_NAME}] Unexpected error: {ex}", exc_info=True)
-                        last_error = str(ex)
+                        err_str = str(ex)
+                        if "space is full" in err_str.lower():
+                            # Account-storage exhaustion — an action only the user can take
+                            # (free up space / upgrade plan), not a code-level failure. A full
+                            # traceback here is just noise; a short warning is enough to act on.
+                            logging.warning(f"[{provider.PROVIDER_NAME}] Account storage is full — cannot add torrent. Free up space or upgrade your plan.")
+                        else:
+                            logging.error(f"[{provider.PROVIDER_NAME}] Unexpected error: {ex}", exc_info=True)
+                        last_error = err_str
                         break
 
                 if not torrent_id:
@@ -467,6 +578,16 @@ class TorrentProcessor:
 
                 # Got a torrent_id — fetch info
                 try:
+                    # No files visible yet. TorBox (and other async providers)
+                    # accept the torrent while still fetching metadata
+                    # (download_state = metaDL / meta_download / queued) — the
+                    # file list populates seconds-to-minutes later. Removing the
+                    # torrent here destroys the download and blacklists the item
+                    # (Doug/DBZ batches were being wiped this way). Poll briefly
+                    # for files to appear; if they still don't, KEEP the torrent
+                    # and return info tagged _pending_files so the Adding queue
+                    # parks the item in Pending Uncached for a later pass.
+                    last_info = None
                     for attempt in range(get_info_max_retries):
                         info = provider.get_torrent_info(torrent_id)
                         if info and len(info.get('files', [])) > 0:
@@ -476,9 +597,33 @@ class TorrentProcessor:
                             self.debrid_provider = provider
                             logging.info(f"[{provider.PROVIDER_NAME}] Successfully got torrent info.")
                             return info
+                        last_info = info
                         time.sleep(get_info_retry_delay)
 
-                    # Info fetched but empty/bad
+                    if last_info and self._is_pending_torrent_state(last_info):
+                        # Poll a bit longer — metaDL usually resolves in 10-30s.
+                        for _extra in range(10):
+                            time.sleep(3)
+                            info = provider.get_torrent_info(torrent_id)
+                            if info and len(info.get('files', [])) > 0:
+                                info['_provider'] = provider.PROVIDER_NAME
+                                self.debrid_provider = provider
+                                logging.info(f"[{provider.PROVIDER_NAME}] Torrent {torrent_id} files appeared after {_extra + 1} extra polls.")
+                                return info
+                            last_info = info
+                        if last_info and self._is_pending_torrent_state(last_info):
+                            # Still resolving — keep the torrent, park the item.
+                            last_info['_provider'] = provider.PROVIDER_NAME
+                            last_info['_pending_files'] = True
+                            self.debrid_provider = provider
+                            logging.info(
+                                f"[{provider.PROVIDER_NAME}] Torrent {torrent_id} added but files still pending "
+                                f"(state={last_info.get('status') or last_info.get('download_state')}) — "
+                                f"keeping torrent, parking item as Pending Uncached."
+                            )
+                            return last_info
+
+                    # Info fetched but empty/bad (dead torrent / error state)
                     if torrent_id:
                         try:
                             provider.remove_torrent(torrent_id, removal_reason="Empty torrent during processing")
@@ -502,6 +647,25 @@ class TorrentProcessor:
                 except Exception as e:
                     logging.error(f"Error cleaning up temp file {temp_file}: {e}")
                     
+    @staticmethod
+    def _is_pending_torrent_state(info: Dict) -> bool:
+        """True when a torrent was accepted but its file list is still populating.
+
+        TorBox reports download_state metaDL / meta_download / metadata / queued
+        while it fetches torrent metadata after accepting an uncached magnet.
+        In those states get_torrent_info() returns an info dict with an empty
+        files list — the torrent is NOT dead. Removing it (as the old code did)
+        destroys the download and blacklists the item. Only error/dead/failed
+        states mean the torrent is genuinely unservable.
+        """
+        status = str(info.get('status') or info.get('download_state') or '').lower()
+        pending = {
+            'metadl', 'meta_dl', 'meta_download', 'metadata', 'queued',
+            'downloading', 'checking', 'magnet_conversion',
+            'waiting_files_selection', 'unknown',
+        }
+        return status in pending
+
     def _process_nzb_result(self, result: Dict, item: Optional[Dict] = None, adding_queue_items: Optional[list] = None) -> Optional[Tuple]:
         """Submit an NZB result to cli_mount and return a synthetic torrent_info tuple."""
         from usenet.climount_client import get_climount_client, reset_climount_client
@@ -667,7 +831,14 @@ class TorrentProcessor:
                 episode_title=None if _is_season_pack else (item or {}).get('episode_title'),
                 tags=(item or {}).get('tags') or None,
             ) or title
-        except Exception:
+        except Exception as _bnt_exc:
+            # Falling back to the raw scraped title silently here means the
+            # resulting cli_mount entry has no imdb tag, no version tag, and no
+            # structured name at all — indistinguishable from naming being
+            # disabled. Log it so a real bug (bad settings lookup, unexpected
+            # season/episode type, etc.) is visible instead of masquerading as
+            # "naming worked but produced a plain title".
+            logging.warning(f'[{item_identifier}] _build_nzb_title failed, falling back to raw title: {_bnt_exc}', exc_info=True)
             job_title = title
 
         # Check if same NZB title already in cli_mount/NzbDAV to avoid duplicates.
@@ -782,9 +953,8 @@ class TorrentProcessor:
                 _genres_raw = _json.loads(_genres_raw)
             except Exception:
                 _genres_raw = [_genres_raw]
-        _is_anime = bool(_item.get('trigger_is_anime')) or any(
-            'anime' in (g or '').lower() for g in _genres_raw
-        )
+        from utilities.media_category import genres_contain_anime
+        _is_anime = bool(_item.get('trigger_is_anime')) or genres_contain_anime(_genres_raw)
         _item_media_type = _item.get('type', '')
         _tags = _item.get('tags') or None
         # tags_exclusive: check content source config
@@ -964,6 +1134,28 @@ class TorrentProcessor:
                 # Check cache across all providers in parallel — use first hit
                 from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
                 providers = self._providers
+                # When TorBox is frozen (usage window), skip its cache checks to avoid 403 spam and speed up RD
+                # Location configurable via $TORBOX_FREEZE_PATHS / $QUICKSTACK_DIR (see _get_torbox_freeze_paths)
+                try:
+                    import os as _os_f2, datetime as _dt_f2
+                    _freeze_candidates = _get_torbox_freeze_paths()
+                    _freeze_active_cache = False
+                    for _cand in _freeze_candidates:
+                        if _os_f2.path.exists(_cand):
+                            try:
+                                _exp2 = open(_cand).read().strip().split()[0]
+                                if _dt_f2.date.fromisoformat(_exp2) >= _dt_f2.date.today():
+                                    _freeze_active_cache = True
+                                    break
+                            except:
+                                _freeze_active_cache = True
+                                break
+                    if _freeze_active_cache:
+                        providers = [pr for pr in providers if "torbox" not in pr.PROVIDER_NAME.lower()]
+                        if len(providers) < len(self._providers):
+                            logging.debug(f"[CacheCheck] Skipping TorBox due to freeze, {len(providers)} provider(s) remaining")
+                except Exception:
+                    pass
                 is_cached = False
                 cache_source = 'direct_check'
                 winning_provider = self.debrid_provider  # default to primary
@@ -1084,13 +1276,19 @@ class TorrentProcessor:
                                 except Exception as remove_err:
                                     logging.warning(f"[{item_identifier}] Could not remove errored torrent {existing_torrent_id}: {remove_err}")
                                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] PHASE: Addition - Adding to debrid service (after removing errored torrent)")
-                                info = self.add_to_account(original_link)
+                                info = self.add_to_account(original_link, item=item)
                             else:
                                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Reusing existing torrent ID: {existing_torrent_id}")
+                                # Existing torrent may still be resolving metadata
+                                # (TorBox metaDL) with an empty file list — tag it
+                                # so the empty-files branch parks the item in
+                                # Pending Uncached instead of removing the torrent.
+                                if existing_info and not existing_info.get('files') and self._is_pending_torrent_state(existing_info):
+                                    existing_info['_pending_files'] = True
                                 info = existing_info
                         else:
                             logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] PHASE: Addition - Adding to debrid service")
-                            info = self.add_to_account(original_link)
+                            info = self.add_to_account(original_link, item=item)
                         
                         if info:
                             # Extract hash after successful addition
@@ -1281,8 +1479,22 @@ class TorrentProcessor:
                                                 if not hasattr(_dc, 'rename_nzb'):
                                                     logging.info(f'[DebridNaming] Client has no rename_nzb for {ident!r}')
                                                     return  # active usenet provider (e.g. nzbdav) has no rename semantics
+                                                # cli_mount only registers an entry as queryable-by-hash after its
+                                                # own periodic sync (default ~10 min) — a 404 in the first several
+                                                # attempts is expected, not proof the entry is gone. Only treat 404
+                                                # as final once it's persisted for that long (20 attempts x 30s).
+                                                _consecutive_404 = 0
+                                                _confirmed_gone_after = 20
                                                 for _attempt in range(100):
-                                                    if _dc.rename_nzb(h, name):
+                                                    _renamed, _not_found = _dc.rename_nzb_with_status(h, name)
+                                                    if _not_found:
+                                                        _consecutive_404 += 1
+                                                        if _consecutive_404 >= _confirmed_gone_after:
+                                                            logging.warning(f'[DebridNaming] {h!r} not found in cli_mount (404) for {_consecutive_404} consecutive attempts — giving up for {ident}')
+                                                            return
+                                                    else:
+                                                        _consecutive_404 = 0
+                                                    if _renamed:
                                                         logging.info(f'[DebridNaming] Renamed {h!r} -> {name!r} for {ident}')
                                                         if item_id:
                                                             try:
@@ -1317,6 +1529,8 @@ class TorrentProcessor:
                                                                     if _cli_ids_dn:
                                                                         _dc.register_cli_ids(h, _cli_ids_dn)
                                                                         logging.info(f'[DebridNaming] Registered {len(_cli_ids_dn)} cli_debrid IDs for {h!r}')
+                                                            if item_id:
+                                                                _dc.push_tags_for_item(h, item_id)
                                                         except Exception as _reg_dn_err:
                                                             logging.debug(f'[DebridNaming] cli_ids registration error: {_reg_dn_err}')
                                                         return
@@ -1334,6 +1548,32 @@ class TorrentProcessor:
                         chosen_result_for_return = result # Store the successful result
                         return info, original_link, chosen_result_for_return # Return all three
                     else:
+                        if info.get('_pending_files'):
+                            # Torrent was accepted (e.g. TorBox metaDL) but its
+                            # file list is still populating. KEEP the torrent —
+                            # removing it here destroys the download. Park the
+                            # item in Pending Uncached so a later pass picks up
+                            # the files once they appear.
+                            logging.info(
+                                f"[{item_identifier}] [Result {idx}/{len(results)}] Torrent {info.get('id')} "
+                                f"added but files pending (metaDL) — parking item in Pending Uncached, keeping torrent."
+                            )
+                            if item:
+                                try:
+                                    from database import update_media_item_state
+                                    update_media_item_state(
+                                        item['id'], "Pending Uncached",
+                                        filled_by_magnet=original_link,
+                                        filled_by_title=result.get('title', ''),
+                                    )
+                                    item['filled_by_magnet'] = original_link
+                                    item['filled_by_title'] = result.get('title', '')
+                                except Exception as _pe:
+                                    logging.error(f"[{item_identifier}] [Result {idx}/{len(results)}] Failed to park item in Pending Uncached: {_pe}")
+                            # Return magnet + result so the Adding queue sees a
+                            # non-empty magnet (its Pending-Uncached state check
+                            # then skips the item instead of blacklisting it).
+                            return None, original_link, result
                         try:
                             if info.get('id'):
                                 logging.info(f"[{item_identifier}] [Result {idx}/{len(results)}] Removing empty torrent {info.get('id')}")

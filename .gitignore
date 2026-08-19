@@ -169,4 +169,7 @@ clear_migration_flag.py
 CLAUDE.md
 dev.sh
 # Kimi project memory
+.DS_Store
+._.DS_Store
+.codegraph/
 .kimi-memory/

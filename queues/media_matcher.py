@@ -268,10 +268,10 @@ class MediaMatcher:
         # historically did not, so unrelated packs could match purely by SxxExx
         # structure (e.g. a "Guardians of the Dafeng" pack collected as Bob's
         # Burgers). Refuse when the text BEFORE the first episode tag is a clear
-        # mismatch with the wanted show. Only trust that prefix when it is
-        # substantial (>=6 alnum chars) — abbreviations ("GOT.") and
-        # episode-title-first names ("S08E01 Brunchsquatch.mkv") are skipped,
-        # and anime (relaxed) matching is untouched.
+        # mismatch with the wanted show. Only episode-title-first names
+        # ("S08E01 Brunchsquatch.mkv") skip verification; even short prefixes
+        # ("DMV.S01E01" filled "Hey Arnold!") are checked. Anime (relaxed)
+        # matching is untouched.
         if not use_relaxed_matching:
             try:
                 _orig = ptt_result.get('original_filename', '') or ''
@@ -281,18 +281,29 @@ class MediaMatcher:
                 )
                 _prefix = _orig[: _tag.start()] if _tag else _orig
                 _alnum = len(re.findall(r'[a-z0-9]', _prefix, re.IGNORECASE))
-                if _alnum >= 6:
+                if _alnum >= 2:
                     _r, _t = _prefix.lower(), series_title.lower()
                     _wr = set(re.findall(r'[a-z0-9]+', _r))
                     _wt = set(re.findall(r'[a-z0-9]+', _t))
                     _word_ov = (len(_wr & _wt) / max(len(_wr), len(_wt))) if _wr and _wt else 0.0
                     _sim = max(_word_ov, fuzz.partial_ratio(_r, _t) / 100.0)
-                    if _sim < 0.20:
+                    # When NO word of the source prefix appears in the wanted
+                    # title, fuzzy partial ratios are noisy. Measured slips:
+                    # 'hit.point.' vs 'angela anaconda' = 0.20 (passed old 0.20
+                    # cutoff) and 'the.walking.dead.dead.city' vs 'madeline' =
+                    # 0.50 (passed 0.50). Short prefixes ('DMV' vs 'hey arnold'
+                    # = 0.0) get the highest floor; legit short names still
+                    # pass ('Doug' 0.75, 'Eek' 0.67, '24' via word overlap).
+                    if _word_ov == 0.0:
+                        _cutoff = 0.65 if _alnum < 6 else 0.60
+                    else:
+                        _cutoff = 0.20
+                    if _sim < _cutoff:
                         logging.warning(
                             f"[MATCH-GUARD] Refusing episode match for '{series_title}' "
                             f"S{target_season}E{target_episode}: source prefix "
-                            f"'{_prefix.strip()[:60]}' similarity {_sim:.2f} < 0.20. "
-                            f"Item will be re-matched / reviewed."
+                            f"'{_prefix.strip()[:60]}' similarity {_sim:.2f} < {_cutoff:.2f} "
+                            f"(word overlap {_word_ov:.2f}). Item will be re-matched / reviewed."
                         )
                         return False
             except Exception as _tvexc:
@@ -302,7 +313,8 @@ class MediaMatcher:
         genres = item.get('genres') or []
         if isinstance(genres, str):
             genres = [genres]
-        is_anime = any('anime' in genre.lower() for genre in genres)
+        from utilities.media_category import genres_contain_anime
+        is_anime = genres_contain_anime(genres)
 
         # --- Relaxed Matching Logic ---
         if use_relaxed_matching:
@@ -822,14 +834,26 @@ class MediaMatcher:
                 return None
 
             # If the best title match is very weak, refuse to link likely-WRONG
-            # content (e.g. The Matrix Reloaded picked for "Cold Storage"). This is
-            # the core fix for the mislinked-movie problem.
-            best_score = max(s for s, _ in scored)
-            if best_score < 0.2:
+            # content. Fuzzy partial ratios of unrelated titles routinely land
+            # in 0.2-0.5 ("Westworld 1973 720p BRRip" vs "New Toy Story" once
+            # slipped past the old 0.2 floor) — so when NO word of the source
+            # name appears in the wanted title, demand a much stronger fuzzy
+            # match (run-together titles like "PuffinRock" still score ~0.95).
+            best_idx = max(range(len(scored)), key=lambda i: scored[i][0])
+            best_score, best_pf = scored[best_idx]
+            best_orig = (best_pf.get('parsed_info', {}) or {}).get('original_filename', '') \
+                or os.path.basename(best_pf.get('path', ''))
+            b_tokens = set(re.findall(r'[a-z0-9]+', best_orig.lower()))
+            t_tokens = set()
+            for _t in item_titles:
+                t_tokens |= set(re.findall(r'[a-z0-9]+', _t.lower()))
+            _word_ov = bool(b_tokens & t_tokens)
+            _movie_cutoff = 0.20 if _word_ov else 0.60
+            if best_score < _movie_cutoff:
                 logging.warning(
                     f"[MATCH-GUARD] Refusing movie match for '{item_titles or item.get('title')}': "
-                    f"best source-name similarity {best_score:.2f} < 0.2 "
-                    f"({os.path.basename(parsed_files[0].get('path',''))}). Item will be re-matched / reviewed."
+                    f"best source-name similarity {best_score:.2f} < {_movie_cutoff:.2f} "
+                    f"(word overlap {_word_ov}) for '{best_orig[:60]}'. Item will be re-matched / reviewed."
                 )
                 return None
 
@@ -899,7 +923,8 @@ class MediaMatcher:
             genres = item.get('genres') or []
             if isinstance(genres, str):
                 genres = [genres]
-            is_anime = any('anime' in genre.lower() for genre in genres)
+            from utilities.media_category import genres_contain_anime
+            is_anime = genres_contain_anime(genres)
             from utilities.settings import get_setting
             file_collection_management = get_setting('File Management', 'file_collection_management')
             using_plex = file_collection_management == 'Plex'
@@ -1220,7 +1245,8 @@ class MediaMatcher:
         genres = original_item.get('genres') or []
         if isinstance(genres, str):
             genres = [genres]
-        is_anime = any('anime' in genre.lower() for genre in genres)
+        from utilities.media_category import genres_contain_anime
+        is_anime = genres_contain_anime(genres)
         file_collection_management = get_setting('File Management', 'file_collection_management')
         using_plex = file_collection_management == 'Plex'
         # Apply relaxed matching globally based on the original item context
@@ -1249,7 +1275,8 @@ class MediaMatcher:
                 candidate_genres = []
             elif isinstance(candidate_genres, str):
                 candidate_genres = [candidate_genres]
-            candidate_is_anime = any('anime' in g.lower() for g in candidate_genres)
+            from utilities.media_category import genres_contain_anime
+            candidate_is_anime = genres_contain_anime(candidate_genres)
 
             # --- Build per-candidate XEM mapping (season-offset only) ---
             candidate_xem_mapping = None

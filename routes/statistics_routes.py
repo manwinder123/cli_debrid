@@ -13,6 +13,8 @@ from routes.extensions import app_start_time
 from debrid import get_debrid_provider, TooManyDownloadsError, ProviderUnavailableError
 from .program_operation_routes import get_program_status
 import json
+import stat
+import threading
 import math
 from functools import wraps
 # Provider-agnostic: avoid direct Real-Debrid import
@@ -1581,6 +1583,220 @@ def get_library_size_api():
              size_str = calculation_error # Return server error if cache fails
 
     return jsonify({'total_library_size': size_str})
+
+
+LOCAL_STATS_CACHE_FILE = os.path.join(DB_CONTENT_DIR, 'local_library_stats_cache.json')
+_LOCAL_STATS_STATE = {
+    'running': False,
+    'started_at': None,
+}
+
+
+def _fmt_bytes(n: float) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB', 'PB'):
+        if n < 1024 or unit == 'PB':
+            return f"{n:.2f} {unit}" if unit != 'B' else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.2f} PB"
+
+
+@statistics_bp.route('/api/library_counts', methods=['GET'])
+@user_required
+def library_counts_api():
+    """Instant DB-backed counts for the home page row (no filesystem walk).
+    If local stats cache exists, also includes DAS file counts for immediate display."""
+    from database.core import get_db_connection
+    conn = get_db_connection()
+    try:
+        movies_total = conn.execute("SELECT COUNT(*) FROM media_items WHERE type='movie'").fetchone()[0]
+        movies_collected = conn.execute(
+            "SELECT COUNT(*) FROM media_items WHERE type='movie' AND collected_at IS NOT NULL").fetchone()[0]
+        episodes_total = conn.execute("SELECT COUNT(*) FROM media_items WHERE type='episode'").fetchone()[0]
+        episodes_collected = conn.execute(
+            "SELECT COUNT(*) FROM media_items WHERE type='episode' AND collected_at IS NOT NULL").fetchone()[0]
+        shows_total = conn.execute(
+            "SELECT COUNT(DISTINCT title) FROM media_items WHERE type='episode'").fetchone()[0]
+        shows_collected = conn.execute(
+            "SELECT COUNT(DISTINCT title) FROM media_items WHERE type='episode' AND collected_at IS NOT NULL").fetchone()[0]
+    finally:
+        conn.close()
+    # Try to include DAS file counts from cache if available (no extra walk)
+    das_counts = {}
+    cached = _read_local_stats_cache()
+    if cached and 'data' in cached:
+        dc = cached['data'].get('das_counts', {})
+        das_counts = {
+            'das_movies_files': dc.get('das_movies_files', 0),
+            'das_shows_files': dc.get('das_shows_files', 0),
+            'das_total_files': dc.get('das_total_files', 0),
+            'das_shows': dc.get('das_shows', 0),
+        }
+    return jsonify({
+        'movies_total': movies_total, 'movies_collected': movies_collected,
+        'episodes_total': episodes_total, 'episodes_collected': episodes_collected,
+        'shows_total': shows_total, 'shows_collected': shows_collected,
+        'das_counts': das_counts,
+        'has_das_cache': bool(cached),
+    })
+def _du_tree_with_count(root: str) -> tuple:
+    """Return (bytes, file_count) for root."""
+    total = 0
+    count = 0
+    stack = [root]
+    while stack:
+        dirpath = stack.pop()
+        try:
+            with os.scandir(dirpath) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                            count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total, count
+
+
+def _read_local_stats_cache() -> Optional[dict]:
+    try:
+        if os.path.exists(LOCAL_STATS_CACHE_FILE):
+            with open(LOCAL_STATS_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'data' in data:
+                return data
+    except Exception as e:
+        logging.error(f"Failed to read local stats cache: {e}")
+    return None
+
+
+def _compute_local_stats_worker():
+    """Walk the symlink tree and the DAS library roots; write a cache file.
+    Runs in a background thread because a full 30+ TB walk takes minutes.
+    Uses parallel walks (ThreadPool) for the 5 roots which are on different
+    physical disks, cutting wall time significantly."""
+    import stat as _stat
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        started = datetime.now()
+        roots = {
+            'symlink_shows': '/symlinks/shows',
+            'symlink_movies': '/symlinks/movies',
+            'das_shows': '/mnt/das_pool/tv-shows-plex-drive',
+            'das_anime_shows': '/mnt/das_pool/anime-tv-shows-plex-drive',
+            'das_movies': '/mnt/das_pool/movies-plex-drive',
+            'das_anime_movies': '/mnt/das_pool/anime-movies-plex-drive',
+        }
+        sizes = {}
+        counts_files = {}
+        # Parallelize the 5 walks - each root is on a different disk for DAS,
+        # and symlink walk is on yet another filesystem. Sequential would be
+        # ~5x slower.
+        def walk_one(item):
+            key, root = item
+            if root and os.path.isdir(root):
+                sz, cnt = _du_tree_with_count(root)
+                return key, sz, cnt
+            return key, 0, 0
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures = {ex.submit(walk_one, kv): kv[0] for kv in roots.items()}
+            for fut in as_completed(futures):
+                key, sz, cnt = fut.result()
+                sizes[key] = sz
+                counts_files[key] = cnt
+        # Item counts straight from the DB (instant)
+        from database.core import get_db_connection
+        conn = get_db_connection()
+        counts = {}
+        try:
+            counts['episodes_collected'] = conn.execute(
+                "SELECT COUNT(*) FROM media_items WHERE type='episode' AND collected_at IS NOT NULL").fetchone()[0]
+            counts['movies_collected'] = conn.execute(
+                "SELECT COUNT(*) FROM media_items WHERE type='movie' AND collected_at IS NOT NULL").fetchone()[0]
+            counts['episodes_total'] = conn.execute(
+                "SELECT COUNT(*) FROM media_items WHERE type='episode'").fetchone()[0]
+            counts['movies_total'] = conn.execute(
+                "SELECT COUNT(*) FROM media_items WHERE type='movie'").fetchone()[0]
+        finally:
+            conn.close()
+        # DAS file counts derived from filesystem walk (actual files on disk)
+        das_counts = {
+            'das_movies_files': counts_files.get('das_movies', 0) + counts_files.get('das_anime_movies', 0),
+            'das_shows_files': counts_files.get('das_shows', 0) + counts_files.get('das_anime_shows', 0),
+            'das_total_files': sum(counts_files.get(k, 0) for k in ['das_movies', 'das_anime_movies', 'das_shows', 'das_anime_shows']),
+            'symlink_movies_files': counts_files.get('symlink_movies', 0),
+            'symlink_shows_files': counts_files.get('symlink_shows', 0),
+        }
+        # Show counts in DAS: count distinct show folders
+        try:
+            das_shows_dirs = set()
+            for root_key in ['das_shows', 'das_anime_shows']:
+                root = roots[root_key]
+                if os.path.isdir(root):
+                    for entry in os.scandir(root):
+                        if entry.is_dir(follow_symlinks=False):
+                            das_shows_dirs.add(entry.name)
+            das_counts['das_shows'] = len(das_shows_dirs)
+        except OSError:
+            das_counts['das_shows'] = 0
+        data = {
+            'sizes_bytes': sizes,
+            'sizes_str': {k: _fmt_bytes(v) for k, v in sizes.items()},
+            'symlink_shows_bytes': sizes.get('symlink_shows', 0),
+            'symlink_movies_bytes': sizes.get('symlink_movies', 0),
+            'das_shows_bytes': sizes.get('das_shows', 0) + sizes.get('das_anime_shows', 0),
+            'das_movies_bytes': sizes.get('das_movies', 0) + sizes.get('das_anime_movies', 0),
+            'counts': counts,
+            'das_counts': das_counts,
+            'counts_files': counts_files,
+            'completed_at': started.isoformat(),
+        }
+        payload = {'data': data, 'timestamp': datetime.now().isoformat(), 'elapsed_s': (datetime.now() - started).total_seconds()}
+        with open(LOCAL_STATS_CACHE_FILE, 'w') as f:
+            json.dump(payload, f)
+        logging.info(f"[LocalStats] computed in {payload['elapsed_s']:.0f}s: "
+                     f"symlink shows={_fmt_bytes(sizes.get('symlink_shows', 0))}, "
+                     f"das shows={_fmt_bytes(sizes.get('das_shows', 0) + sizes.get('das_anime_shows', 0))} "
+                     f"das files: movies={das_counts['das_movies_files']} shows={das_counts['das_shows_files']}")
+    except Exception as e:
+        logging.error(f"[LocalStats] compute failed: {e}", exc_info=True)
+    finally:
+        _LOCAL_STATS_STATE['running'] = False
+        _LOCAL_STATS_STATE['started_at'] = None
+        _LOCAL_STATS_STATE['finished_at'] = datetime.now().isoformat()
+
+
+@statistics_bp.route('/api/local_library_stats', methods=['GET', 'POST'])
+@user_required
+def local_library_stats_api():
+    """GET returns cached symlink-vs-DAS size breakdown + counts.
+    POST or GET?refresh=1 starts a background (re)compute — the frontend polls until ready."""
+    global _LOCAL_STATS_STATE
+    # Support both POST and GET?refresh=1 for triggering (avoids CSRF issues with POST)
+    should_refresh = request.method == 'POST' or request.args.get('refresh') == '1' or request.args.get('force') == '1'
+    if should_refresh:
+        if not _LOCAL_STATS_STATE['running']:
+            _LOCAL_STATS_STATE['running'] = True
+            _LOCAL_STATS_STATE['started_at'] = datetime.now().isoformat()
+            import threading as _th
+            t = _th.Thread(target=_compute_local_stats_worker, daemon=True)
+            t.start()
+            logging.info("[LocalStats] background compute started (triggered via %s)", request.method)
+        return jsonify({'status': 'computing', 'started_at': _LOCAL_STATS_STATE['started_at']})
+    if _LOCAL_STATS_STATE['running']:
+        _elapsed = None
+        try:
+            _elapsed = (datetime.now() - datetime.fromisoformat(_LOCAL_STATS_STATE['started_at'])).total_seconds()
+        except (ValueError, TypeError):
+            pass
+        return jsonify({'status': 'computing', 'started_at': _LOCAL_STATS_STATE['started_at'], 'elapsed_s': _elapsed})
+    cached = _read_local_stats_cache()
+    if cached:
+        return jsonify({'status': 'ready', **cached})
+    return jsonify({'status': 'never'})
 
 @statistics_bp.route('/calendar')
 @user_required

@@ -2239,7 +2239,8 @@ def _add_nzb_pack_to_usenet(episode_nzb_urls, fallback_nzb_urls, title, year, me
         job_id = None
         nzb_text = None
 
-        _is_anime = any('anime' in (g or '').lower() for g in (genres or []))
+        from utilities.media_category import genres_contain_anime
+        _is_anime = genres_contain_anime(genres)
         # Try primary then fallbacks
         for url in [primary_url] + fallbacks:
             if not url:
@@ -2426,7 +2427,8 @@ def _add_nzb_to_usenet(nzb_url, title, year, media_type, season, episode, versio
         tags=selected_tags or None,
     )
 
-    _is_anime = any('anime' in (g or '').lower() for g in (genres or []))
+    from utilities.media_category import genres_contain_anime
+    _is_anime = genres_contain_anime(genres)
     _submit_title = str(_job_title or title or '')
     # Submit — use pre-fetched content directly if available to avoid double-fetch
     if _nzb_xml:

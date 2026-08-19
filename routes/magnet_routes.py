@@ -1339,11 +1339,20 @@ def confirm_manual_assignment():
                     final_torrent_id = readd_result_id
                     logging.info(f"Successfully added permanent magnet torrent with ID: {final_torrent_id}")
                 else:
-                    logging.error(f"Failed to add permanent magnet torrent for manual assignment: {magnet_link[:60]}...")
-                    return jsonify({'success': False, 'error': 'Failed to add torrent to debrid service. It may already be added, or the debrid provider rejected it.'}), 503
+                    # The torrent may already exist in the account (re-assigning
+                    # files from a pack that was linked before, e.g. pack_reuse).
+                    # The checking queue resolves files by initial_torrent_id, so
+                    # proceed with the existing ID instead of failing the whole
+                    # assignment.
+                    logging.warning(
+                        f"Re-add returned no id for magnet {magnet_link[:60]}... "
+                        f"Proceeding with existing torrent ID {initial_torrent_id}."
+                    )
             except Exception as readd_error:
-                logging.error(f"Error adding permanent magnet torrent for manual assignment: {readd_error}", exc_info=True)
-                return jsonify({'success': False, 'error': f'Failed to add torrent to debrid service: {readd_error}'}), 503
+                logging.warning(
+                    f"Re-add failed for magnet {magnet_link[:60]}... "
+                    f"Proceeding with existing torrent ID {initial_torrent_id}: {readd_error}"
+                )
         # else: torrent-file uploads have no magnet to re-add; the file was already
         # added for real (not a disposable preview) in prepare_manual_assignment,
         # so initial_torrent_id is already permanent for that path.
@@ -1528,6 +1537,25 @@ def confirm_manual_assignment():
                 if item_id:
                     added_items_count += 1
                     successfully_added_items.append(item_id)
+                    # Force the item straight into Checking with the assigned
+                    # file — a manual assignment must NOT go back through the
+                    # scraping queue (it would re-scrape and add redundant
+                    # season torrents while a complete pack already exists).
+                    try:
+                        from database.core import get_db_connection as _gdb
+                        _conn_f = _gdb()
+                        _conn_f.execute(
+                            "UPDATE media_items SET state='Checking',"
+                            " filled_by_file=?, filled_by_title=?,"
+                            " filled_by_torrent_id=?, filled_by_magnet=? WHERE id=?",
+                            (selected_filename, torrent_filename,
+                             str(final_torrent_id), magnet_link, int(item_id)),
+                        )
+                        _conn_f.commit()
+                        _conn_f.close()
+                        logging.info(f"Forced item {item_id} to Checking with file {selected_filename}")
+                    except Exception as _force_err:
+                        logging.warning(f"Could not force item {item_id} to Checking: {_force_err}")
                     # Prepare data for notification
                     processed_items_info.append({
                         'id': item_id,
