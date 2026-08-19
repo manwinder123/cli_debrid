@@ -26,7 +26,7 @@ from cli_battery.app.direct_api import DirectAPI
 import os
 import pickle
 from datetime import datetime, timedelta
-from .plex_token_manager import update_token_status, get_token_status
+from .plex_token_manager import update_token_status, get_token_status, load_token_status
 import time
 import aiohttp
 import asyncio
