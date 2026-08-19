@@ -339,11 +339,24 @@ def create_episode_item(show_item: Dict[str, Any], season_number: int, episode_n
             except ValueError:
                  logging.warning(f"Invalid show default airtime format: {default_airtime_str}. Using default 19:00.")
 
+    # 'year' is not always present on show metadata (e.g. unreleased/sparsely-documented
+    # shows) — fall back to deriving it from a release date rather than crashing.
+    show_year = show_item.get('year')
+    if not isinstance(show_year, int):
+        for _date_field in ('first_aired', 'release_date'):
+            _date_val = show_item.get(_date_field)
+            if _date_val and len(str(_date_val)) >= 4:
+                try:
+                    show_year = int(str(_date_val)[:4])
+                    break
+                except (ValueError, TypeError):
+                    pass
+
     episode_item = {
         'imdb_id': show_item['imdb_id'],
         'tmdb_id': show_item['tmdb_id'],
         'title': show_item['title'],
-        'year': show_item.get('year'),
+        'year': show_year,
         'season_number': int(season_number),
         'episode_number': int(episode_number),
         'episode_title': episode_data.get('title', f"Episode {episode_number}"),
@@ -1093,15 +1106,6 @@ def get_release_date(media_details: Dict[str, Any], imdb_id: Optional[str] = Non
     old_premiere_releases = [date for date in premiere_releases if date < current_date - timedelta(days=730)]  # 24 months
     if old_premiere_releases:
         return max(old_premiere_releases).strftime("%Y-%m-%d")
-
-    # Final fallback: a theatrical date that has already passed is still a valid
-    # release reference for brand-new titles (e.g. a film currently in theaters
-    # with no digital/physical date on TMDB yet, like Dune: Part Three) —
-    # otherwise they stay 'Unknown' until the 180-day threshold. Only past
-    # dates are used, never future announcements.
-    recent_past_theatrical = [date for date in theatrical_releases if date <= current_date]
-    if recent_past_theatrical:
-        return max(recent_past_theatrical).strftime("%Y-%m-%d")
 
     # If we've reached this point, there are no suitable release dates
     logging.warning(f"No valid release date found for IMDb ID: {imdb_id}. "

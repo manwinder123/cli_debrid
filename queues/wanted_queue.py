@@ -2,19 +2,17 @@ import logging
 from datetime import datetime, timedelta, date, time as dt_time
 from typing import Dict, Any, List
 import time
-import os
 
 from utilities.settings import get_setting
 from database.manual_blacklist import is_blacklisted
 from database.core import get_db_connection
 from database.database_reading import get_all_media_items, check_existing_media_item
 from database.database_writing import update_media_item_state, update_blacklisted_date, remove_from_media_items
-from utilities.local_library_scan import check_local_file_in_nas_paths
 
 # Define constants for queue size limits
 SCRAPING_QUEUE_MAX_SIZE = 500
 # New threshold to pause Wanted processing entirely
-WANTED_THROTTLE_SCRAPING_SIZE = 400
+WANTED_THROTTLE_SCRAPING_SIZE = 100
 
 class WantedQueue:
     def __init__(self):
@@ -136,40 +134,17 @@ class WantedQueue:
         try:
             # Check 1: Reconciliation (adapted from original _reconcile_with_existing_items and process loop)
             # This check needs to be robust. Using check_existing_media_item.
-            # Exempt user-initiated adds (Request button / manual Magnet_Assigner) — those are an
-            # explicit request for an additional/replacement copy and must scrape their own file
-            # rather than being silently dropped because a prior copy is already Collected/Upgrading.
-            # Automated content-source adds keep the original dedup behavior.
+            # Exempt user-initiated adds (Request button / content_requester, manual
+            # Magnet_Assigner) from this check — those are an explicit request for a
+            # second/replacement copy and must be allowed to scrape and collect their
+            # own file rather than being silently deleted because a prior copy is
+            # already Collected/Upgrading. Existing rows with no content_source (or
+            # any automated content-source value) keep the original behavior.
             is_user_initiated_add = item.get('content_source') in ('content_requester', 'Magnet_Assigner')
             if not is_user_initiated_add and check_existing_media_item(item, item.get('version'), ['Collected', 'Upgrading']):
                 logging.info(f"Item ID {item_id} (Version: {item.get('version')}) already exists in Collected/Upgrading state. Removing duplicate from Wanted.")
                 remove_from_media_items(item_id)
                 return {'status': 'reconciled', 'item_data': item, 'message': f"Reconciled and removed {item_identifier}"}
-
-            # Check 1b: NAS / Network Drive — if a local copy exists in a configured
-            # NAS path, skip scraping entirely and mark the item as Collected.
-            # This prevents unnecessary rescrapes for media that already has a local
-            # transcoded copy (e.g. from Tdarr) in a NAS / Network Drive path.
-            _nas_file = check_local_file_in_nas_paths(item)
-            if _nas_file:
-                logging.info(
-                    f"[{item_identifier}] Local file found in NAS path: "
-                    f"{_nas_file['path']} ({_nas_file['size_gb']} GB). "
-                    f"Skipping scrape, marking as Collected."
-                )
-                # Update location_on_disk to point to the NAS file and record the
-                # real filename so downstream flows (reconcile, Plex cleanup)
-                # know the item's actual file.
-                from database.database_writing import update_media_item
-                update_media_item(
-                    item['id'],
-                    location_on_disk=_nas_file['path'],
-                    filled_by_file=os.path.basename(_nas_file['path']),
-                    state='Collected',
-                )
-                self.remove_item(item)
-                return {'status': 'reconciled', 'item_data': item,
-                        'message': f"NAS file found: {_nas_file['path']}"}
 
             is_magnet_assigned = item.get('content_source') == 'Magnet_Assigner'
             version = item.get('version')
@@ -256,19 +231,7 @@ class WantedQueue:
                 effective_release_date_to_parse = physical_release_date_str
                 log_release_type = "physical release"
             
-            _no_valid_date = (not effective_release_date_to_parse or str(effective_release_date_to_parse).lower() in ['unknown', 'none'])
-            if not is_magnet_assigned and _no_valid_date:
-                if item.get('type') == 'episode':
-                    # Episodes with unknown/None release dates are almost always
-                    # OLD content whose metadata lacks dates (e.g. DBZ Abridged,
-                    # Elliot Moose, fan/archive shows) — not upcoming releases.
-                    # Parking them in Unreleased is a dead-end: the Unreleased
-                    # queue only returns items with valid future dates, so they
-                    # would never be scraped again. Treat as scrape-ready; the
-                    # no-match two-strike bound blacklists genuinely unservable
-                    # items and the unblacklist retry re-checks them later.
-                    logging.info(f"[{item_identifier}] Episode has no valid {log_release_type} date — treating as scrape-ready (old content).")
-                    return {'status': 'scrape', 'item_data': item, 'message': f"{item_identifier} no valid date, scraping as old content."}
+            if not is_magnet_assigned and (not effective_release_date_to_parse or str(effective_release_date_to_parse).lower() in ['unknown', 'none']):
                 logging.debug(f"Item {item_identifier} has no valid {log_release_type} date. Moving to Unreleased.")
                 queue_manager.move_to_unreleased(item, "Wanted")
                 return {'status': 'unreleased', 'item_data': item, 'message': f"{item_identifier} moved to Unreleased (no valid {log_release_type} date)."}
@@ -277,12 +240,6 @@ class WantedQueue:
                     release_date = datetime.strptime(str(effective_release_date_to_parse), '%Y-%m-%d').date()
                 except ValueError:
                     if not is_magnet_assigned:
-                        if item.get('type') == 'episode':
-                            # Same old-content rationale as above: a malformed
-                            # episode date is a metadata gap, not an upcoming
-                            # release. Scrape it.
-                            logging.info(f"[{item_identifier}] Episode has invalid {log_release_type} date '{effective_release_date_to_parse}' — treating as scrape-ready (old content).")
-                            return {'status': 'scrape', 'item_data': item, 'message': f"{item_identifier} invalid date, scraping as old content."}
                         logging.warning(f"Invalid {log_release_type} date format for item {item_identifier}: {effective_release_date_to_parse}. Moving to Unreleased.")
                         queue_manager.move_to_unreleased(item, "Wanted")
                         return {'status': 'unreleased', 'item_data': item, 'message': f"{item_identifier} moved to Unreleased (invalid {log_release_type} date)."}
@@ -481,17 +438,6 @@ class WantedQueue:
             params = []
             order_by_clauses = []
             sort_order_type = get_setting("Queue", "queue_sort_order", "None")
-            # Fresh/never-tried items first, previously-blacklisted items last.
-            # Failed items still retest on their blacklist cycle — they just
-            # queue behind everything else inside that cycle, so the long
-            # tail never starves entirely. Default off; toggle in Queue settings.
-            prioritize_never_failed = get_setting("Queue", "prioritize_never_failed", False)
-            if prioritize_never_failed:
-                order_by_clauses.append(
-                    "CASE WHEN blacklisted_date IS NULL THEN 0 ELSE 1 END"
-                )
-                # Within the retry group, least-failed items first.
-                order_by_clauses.append("COALESCE(blacklist_count, 0) ASC")
             if sort_order_type == "Movies First":
                 order_by_clauses.append("CASE type WHEN 'movie' THEN 0 ELSE 1 END")
             elif sort_order_type == "Episodes First":
@@ -548,21 +494,12 @@ class WantedQueue:
                         type_priority = 0 if item.get('type') == 'movie' else 1
                     elif sort_order_type == "Episodes First":
                         type_priority = 0 if item.get('type') == 'episode' else 1
-
-                    # Primary key: never-blacklisted items before retry items
-                    # (same rule as the SQL ordering, re-applied here because
-                    # content_source_priority re-sorts candidates in memory).
-                    if prioritize_never_failed:
-                        never_failed_priority = 0 if not item.get('blacklisted_date') else 1
-                    else:
-                        never_failed_priority = 0
-                    fail_count = item.get('blacklist_count') or 0
                     
                     if sort_by_release_date:
                         release_date_val = item.get('release_date') or ''
-                        return (never_failed_priority, fail_count, priority_index, type_priority, release_date_val, item.get('title', ''))
+                        return (priority_index, type_priority, release_date_val, item.get('title', ''))
                     else:
-                        return (never_failed_priority, fail_count, priority_index, type_priority, item.get('title', ''))
+                        return (priority_index, type_priority, item.get('title', ''))
                 candidate_items.sort(key=get_source_priority_key)
 
             # 4. Process Candidate Items

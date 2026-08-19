@@ -912,6 +912,7 @@ def prepare_manual_assignment():
                 # requested season: fall back to the shared metadata provider
                 # (TVDB/TMDB via DirectAPI) used elsewhere in the app.
                 try:
+                    from cli_battery.app.direct_api import DirectAPI
                     fallback_seasons_data, source = DirectAPI.get_show_seasons(metadata.get('imdb_id'))
                     logging.info(f"Trakt missing needed season data; used fallback provider '{source}' for {metadata.get('imdb_id')} in prepare_manual_assignment")
                     if fallback_seasons_data:
@@ -926,7 +927,7 @@ def prepare_manual_assignment():
 
             if seasons_data:
                 metadata['seasons'] = {}
-                # Convert integer keys from Trakt to string keys for internal use
+                # Convert integer keys to string keys for internal use
                 for season_num, season_info in seasons_data.items():
                     metadata['seasons'][season_num] = {
                         'episodes': season_info.get('episodes', {}),
@@ -947,360 +948,6 @@ def prepare_manual_assignment():
                         f"for {metadata.get('imdb_id')}"
                     )
 
-        # --- ADD LOGGING HERE ---
-        logging.debug(f"Metadata seasons before creating items: {json.dumps(metadata.get('seasons', {}), indent=2)}")
-        # --- END LOGGING ---
-
-        # Determine target media items based on selection
-        target_items = []
-        if media_type == 'movie':
-            item = create_movie_item(metadata, title, year, version, torrent_id, magnet_link)
-            item['item_key'] = f"movie_{item['tmdb_id']}"
-            target_items.append(item)
-        else: # TV Show
-            if selection_type == 'all':
-                target_items = create_full_series_items(metadata, title, year, version, torrent_id, magnet_link)
-            elif selection_type == 'seasons':
-                target_items = create_season_items(metadata, title, year, version, torrent_id, magnet_link, selected_seasons)
-            else: # Single episode
-                try:
-                    season_number = int(season)
-                    episode_number = int(episode)
-                    target_items = [create_episode_item(metadata, title, year, version, torrent_id, magnet_link, season_number, episode_number)]
-                except (ValueError, TypeError):
-                    # Return JSON error
-                    return jsonify({'success': False, 'error': 'Invalid season or episode number provided.'}), 400
-            
-            # Add unique keys
-            for item in target_items:
-                 item['item_key'] = f"ep_{item['tmdb_id']}_s{item['season_number']:02d}e{item['episode_number']:02d}"
-
-        if not target_items:
-            error_msg = 'Could not determine target media items based on selection.'
-            logging.error(f"Failed to determine target items. Selection: {selection_type}, Seasons: {selected_seasons}, S/E: {season}/{episode}")
-            # Return JSON error
-            return jsonify({'success': False, 'error': error_msg}), 400
-
-        # --- SORT target_items --- 
-        def sort_key(item):
-            if item.get('type') == 'movie':
-                # Assign a low sort order for movies to appear first
-                return (-1, -1)
-            else:
-                # Sort by season then episode number
-                return (item.get('season_number', 999), item.get('episode_number', 999))
-
-        target_items.sort(key=sort_key)
-        logging.debug(f"Sorted target_items: {[item.get('item_key', 'N/A') for item in target_items]}")
-        # --- END SORT ---
-
-        # --- Re-add PTT Parsing ---
-        logging.info("Parsing video file names using PTT...")
-        parsed_video_files = []
-        for f in video_files:
-            # Only parse if path is a non-empty string
-            file_path = f.get('path')
-            if isinstance(file_path, str) and file_path:
-                filename = os.path.basename(file_path)
-                logging.debug(f"Parsing filename: '{filename}' (from path: '{file_path}')")
-                parsed = parse_with_ptt(filename)
-                if not parsed.get('parsing_error'):
-                    parsed_video_files.append({
-                        'original': f, # Store the original file dict
-                        'parsed': parsed,
-                    })
-                else:
-                    logging.warning(f"PTT parsing error for filename '{filename}': {parsed.get('parsing_error')}")
-            else:
-                logging.warning(f"Skipping file parsing due to invalid path: {f.get('path')}")
-        logging.info(f"Successfully parsed {len(parsed_video_files)} video file names.")
-        # --- End Re-add PTT Parsing ---
-
-        # --- Start Auto-assignment Logic ---
-        logging.info("Attempting automatic file assignment...")
-        
-        # Add flags to track usage/assignment
-        for f_info in parsed_video_files:
-            f_info['used'] = False
-        for item in target_items:
-            item['assigned'] = False
-            item['suggested_file_path'] = None # Ensure initialization
-
-        assignment_count = 0
-
-        # --- Phase 1: S/E Matching and Movie Matching ---
-        logging.info("Phase 1: Attempting S/E and Movie matching...")
-        for item in target_items:
-            if item['assigned']: # Skip if already assigned (e.g., by movie logic below?)
-                continue
-
-            item_type = item.get('type')
-
-            # --- Movie Logic: Assign largest file ---
-            if item_type == 'movie':
-                if video_files: # Ensure there are video files to check
-                    # Find the largest *unused* video file
-                    unused_parsed_files = [f for f in parsed_video_files if not f['used']]
-                    if unused_parsed_files:
-                        # Find original file dict corresponding to largest unused parsed file
-                        largest_parsed_file_info = max(unused_parsed_files, key=lambda f: f['original'].get('bytes', 0))
-                        largest_filename = largest_parsed_file_info['original'].get('filename')
-                        if largest_filename:
-                             item['suggested_file_path'] = largest_filename
-                             item['assigned'] = True
-                             largest_parsed_file_info['used'] = True # Mark this file as used
-                             assignment_count += 1
-                             logging.info(f"[Phase 1] Auto-assigned largest unused file '{largest_parsed_file_info['original'].get('path')}' to movie '{item.get('title')}'")
-                        else:
-                             logging.warning(f"[Phase 1] Could not assign largest file for movie '{item.get('title')}' - filename missing.")
-                    else:
-                         logging.warning(f"[Phase 1] Cannot assign largest file for movie '{item.get('title')}' - no unused video files found.")
-                else:
-                    logging.warning(f"[Phase 1] Cannot assign largest file for movie '{item.get('title')}' - no video files found at all.")
-                continue # Move to the next item
-
-            # --- Episode S/E Logic ---
-            elif item_type == 'episode':
-                potential_matches = []
-                item_season = item.get('season_number')
-                item_episode = item.get('episode_number')
-
-                if item_season is None or item_episode is None:
-                    logging.warning(f"[Phase 1] Skipping S/E match for item {item.get('item_key')} due to missing S/E numbers.")
-                    continue
-
-                # Iterate through UNUSED parsed files
-                for file_info in [f for f in parsed_video_files if not f['used']]:
-                    parsed = file_info['parsed']
-                    match = False
-                    parsed_seasons = parsed.get('seasons', [])
-                    parsed_episodes = parsed.get('episodes', [])
-
-                    try:
-                        season_match_strict = (item_season in parsed_seasons)
-                        episode_match = (item_episode in parsed_episodes)
-                        season_match = season_match_strict
-                        if not parsed_seasons and item_season == 1:
-                            season_match = True
-                        if season_match and episode_match:
-                            match = True
-                    except Exception as match_err:
-                         logging.error(f"[Phase 1] Error during S/E matching logic for item {item.get('item_key')} and file {file_info['original']['path']}: {match_err}", exc_info=True)
-
-                    if match:
-                        potential_matches.append(file_info)
-
-                # Assign if exactly one unique S/E match is found among unused files
-                if len(potential_matches) == 1:
-                    match_info = potential_matches[0]
-                    suggested_filename = match_info['original'].get('filename')
-                    if suggested_filename:
-                        item['suggested_file_path'] = suggested_filename
-                        item['assigned'] = True
-                        match_info['used'] = True # Mark file as used
-                        assignment_count += 1
-                        logging.info(f"[Phase 1] Auto-assigned file '{match_info['original']['path']}' to item '{item.get('item_key')}' based on S/E match.")
-                    else:
-                         logging.warning(f"[Phase 1] Could not assign S/E matched file '{match_info['original']['path']}' to item '{item.get('item_key')}' - filename missing.")
-                elif len(potential_matches) > 1:
-                     logging.warning(f"[Phase 1] Found {len(potential_matches)} potential S/E file matches among unused files for item '{item.get('item_key')}'. Leaving unassigned for Phase 2. Files: {[p['original']['path'] for p in potential_matches]}")
-            
-            # --- Handle other item types ---
-            else:
-                 logging.warning(f"[Phase 1] Skipping assignment for unrecognized item type: {item_type} for item key {item.get('item_key')}")
-
-        logging.info(f"Phase 1 Complete. Assigned {assignment_count} items based on S/E or Movie logic.")
-
-        # --- Phase 1.5: Anime absolute-episode-number matching ---
-        # Anime / scene releases frequently name files with a plain episode number
-        # ("Dragon.Ball.Z.001.480p...") that PTT cannot turn into S/E. Map those
-        # numbers to episodes via series-absolute position so they auto-suggest.
-        logging.info("Phase 1.5: Attempting anime absolute-episode matching...")
-        _abs_map = _build_anime_abs_map(metadata) if metadata.get('seasons') else {}
-        phase15_assignment_count = 0
-        if _abs_map:
-            for _item in [it for it in target_items
-                          if not it.get('assigned') and it.get('type') == 'episode']:
-                _item_se = (_item.get('season_number'), _item.get('episode_number'))
-                _abs_nums = [n for n, se in _abs_map.items() if se == _item_se]
-                if not _abs_nums:
-                    continue
-                _target_abs = _abs_nums[0]
-                for _finfo in [f for f in parsed_video_files if not f['used']]:
-                    # Only consider files PTT couldn't resolve to S/E
-                    if _finfo['parsed'].get('seasons') or _finfo['parsed'].get('episodes'):
-                        continue
-                    _num = _extract_anime_episode_number(_finfo['original'].get('filename') or '')
-                    if _num == _target_abs:
-                        _item['suggested_file_path'] = _finfo['original'].get('filename')
-                        _item['assigned'] = True
-                        _finfo['used'] = True
-                        phase15_assignment_count += 1
-                        logging.info(
-                            f"[Phase 1.5] Auto-assigned '{_finfo['original'].get('path')}' "
-                            f"to '{_item.get('item_key')}' (absolute ep {_target_abs})"
-                        )
-                        break
-        assignment_count += phase15_assignment_count
-        logging.info(f"Phase 1.5 Complete. Assigned {phase15_assignment_count} items via absolute episode numbers.")
-
-        # --- Phase 2: Title Matching Fallback (File-Centric) ---
-        logging.info("Phase 2: Attempting Title matching for remaining items...")
-        phase2_assignment_count = 0
-        MATCH_THRESHOLD = 85 # Same threshold as before, adjust if needed
-
-        # Get unassigned items (episodes only, as movies handled in Phase 1)
-        # Make a copy to allow removal while iterating
-        unassigned_items = [item for item in target_items if not item['assigned'] and item['type'] == 'episode']
-        # Get unused files (using the parsed_video_files structure which links to original)
-        unused_files_info = [f_info for f_info in parsed_video_files if not f_info['used']]
-
-        logging.debug(f"[Phase 2] Starting with {len(unassigned_items)} unassigned episode items and {len(unused_files_info)} unused files.")
-
-        # Iterate through each UNUSED file
-        for file_info in unused_files_info:
-            original_file = file_info['original']
-            raw_filename = original_file.get('filename', '')
-            if not raw_filename:
-                logging.debug(f"[Phase 2] Skipping file {original_file.get('path')} as it has no filename.")
-                continue
-
-            # Clean the filename for matching
-            cleaned_filename_base, _ = os.path.splitext(raw_filename)
-            cleaned_filename_base = cleaned_filename_base.lower()
-            
-            # --- AGGRESSIVE CLEANING --- 
-            # Remove content in brackets/parentheses
-            cleaned_filename = re.sub(r'[\(\[].*?[\)\]]', '', cleaned_filename_base)
-            # Remove common resolutions/quality tags (simplified)
-            cleaned_filename = re.sub(r'\b(480p|720p|1080p|2160p|4k|uhd|[0-9]{3,4}x[0-9]{3,4})\b', '', cleaned_filename, flags=re.IGNORECASE)
-            # Remove common codecs/formats (simplified)
-            cleaned_filename = re.sub(r'\b(x264|h264|x265|h265|aac|dts|ac3|web-dl|webrip|bluray|remux)\b', '', cleaned_filename, flags=re.IGNORECASE)
-            
-            # --- NEW: Remove S/E patterns --- 
-            # e.g., s01e01, s1e1, season 1 episode 1, etc.
-            cleaned_filename = re.sub(r'\b(s(\d{1,2})e(\d{1,3})|season\s*\d{1,2}\s*episode\s*\d{1,3})\b', '', cleaned_filename, flags=re.IGNORECASE)
-            # --- END NEW ---
-
-            # Remove trailing hyphens/dots/spaces often left after cleaning/before release group
-            cleaned_filename = re.sub(r'[\s._-]+$', '', cleaned_filename).strip()
-            # --- END AGGRESSIVE CLEANING ---
-
-            logging.debug(f"[Phase 2] Processing file: '{raw_filename}' (BaseClean: '{cleaned_filename_base}', AggressiveClean: '{cleaned_filename}')")
-
-            best_match_item = None
-            best_match_score = 0
-            best_match_item_index = -1 # Index within the current unassigned_items list
-
-            # Compare this file against all currently UNASSIGNED episode items
-            for idx, item in enumerate(unassigned_items):
-                item_episode_title = item.get('episode_title', '').lower()
-                item_key = item.get('item_key', 'N/A')
-
-                # Skip generic titles or items without titles
-                if not item_episode_title or item_episode_title == f'episode {item.get("episode_number")}':
-                    continue
-
-                # Calculate fuzzy match score
-                # --- CHANGE: Use token_set_ratio --- 
-                score = fuzz.token_set_ratio(item_episode_title, cleaned_filename)
-                # --- END CHANGE ---
-
-                # Check if this is the best match *for this file* so far and meets threshold
-                if score > best_match_score and score >= MATCH_THRESHOLD:
-                    best_match_score = score
-                    best_match_item = item
-                    best_match_item_index = idx
-
-            # After checking all unassigned items for the current file:
-            # If we found a best match above the threshold for this file
-            if best_match_item is not None:
-                # Assign this file to that best matching item
-                best_match_item['suggested_file_path'] = original_file['filename']
-                best_match_item['assigned'] = True
-                file_info['used'] = True # Mark the file_info dict (containing original+parsed) as used
-                phase2_assignment_count += 1
-                assignment_count += 1 # Increment total count
-
-                logging.info(f"[Phase 2] Auto-assigned file '{original_file.get('path')}' to item '{best_match_item.get('item_key')}' based on FUZZY FILENAME match ('{best_match_item.get('episode_title')}' vs AGGRESSIVELY CLEANED '{cleaned_filename}', Score: {best_match_score}).")
-
-                # Remove the assigned item from the list so it can't be matched by another file
-                del unassigned_items[best_match_item_index]
-                logging.debug(f"[Phase 2] Removed assigned item {best_match_item.get('item_key')} from pool. Remaining unassigned: {len(unassigned_items)}")
-
-        logging.info(f"Phase 2 Complete. Assigned {phase2_assignment_count} additional items based on Title logic.")
-        # --- End Phase 2 ---
-
-        logging.info(f"Completed automatic assignment attempt. Suggested assignments for {assignment_count} out of {len(target_items)} items.")
-
-        import uuid as _uuid
-        token = str(_uuid.uuid4())
-        with _assignment_store_lock:
-            _assignment_store[token] = {
-                'target_items': target_items,
-                'video_files': video_files,
-                'magnet_link': actual_magnet_link,
-                'torrent_filename': torrent_filename,
-                'torrent_id': torrent_id,
-                'version': version,
-                'is_torrent_file': torrent_file is not None
-            }
-        return jsonify({'success': True, 'redirect_url': url_for('magnet.show_manual_assignment', token=token)})
-
-    except Exception as e:
-        # Catch-all for unexpected errors
-        error_msg = f"An unexpected error occurred while preparing assignment: {str(e)}"
-        logging.error(error_msg, exc_info=True)
-        # Return JSON error
-        return jsonify({'success': False, 'error': 'An internal server error occurred. Please check logs.'}), 500
-
-@magnet_bp.route('/show_manual_assignment', methods=['GET'])
-@admin_required
-def show_manual_assignment():
-    """Display the manual assignment page using data stored in the server-side store."""
-    token = request.args.get('token')
-    assignment_data = None
-    if token:
-        with _assignment_store_lock:
-            assignment_data = _assignment_store.pop(token, None)
-
-    if not assignment_data:
-        flash('No assignment data found. Please start the process again.', 'warning')
-        return redirect(url_for('magnet.assign_magnet'))
-
-    return render_template('manual_assignment.html', **assignment_data)
-
-@magnet_bp.route('/confirm_manual_assignment', methods=['POST'])
-@admin_required
-def confirm_manual_assignment():
-    """Confirm the manual file assignments and add items to the database."""
-    try:
-        # Get data submitted from the manual assignment form
-        assignments = request.form.to_dict(flat=False) # Get as dict of lists
-        
-        # Extract common data
-        magnet_link = assignments.pop('magnet_link', [None])[0]
-        torrent_filename = assignments.pop('torrent_filename', [None])[0]
-        initial_torrent_id = assignments.pop('torrent_id', [None])[0]
-        version = assignments.pop('version', [None])[0]
-        is_torrent_file = assignments.pop('is_torrent_file', [False])[0]
-
-        if not all([torrent_filename, initial_torrent_id, version]):
-             return jsonify({'success': False, 'error': 'Missing essential torrent information in submission.'}), 400
-
-        # Extract torrent hash
-        torrent_hash = None
-        if magnet_link and magnet_link.startswith('magnet:'):
-            hash_match = re.search(r'btih:([a-fA-F0-9]{40})', magnet_link)
-            if hash_match:
-                torrent_hash = hash_match.group(1).lower()
-        elif is_torrent_file:
-            # For torrent files, we need to extract hash from the torrent ID
-            # This is a limitation - we don't have the original torrent file to extract hash
-            # We'll use the torrent ID as a fallback for tracking purposes
-            logging.info(f"Using torrent ID {initial_torrent_id} as hash for torrent file tracking")
-            torrent_hash = f"torrent_file_{initial_torrent_id}"
-        
         # De-dupe: if this exact submission (same hash) was already confirmed moments
         # ago, don't re-add the magnet or recreate items again — a retried/duplicate
         # POST (double-click, page retry after the earlier missing-torrent bug, etc.)
@@ -1308,6 +955,7 @@ def confirm_manual_assignment():
         # time. Only guards against near-immediate re-submission; a legitimate
         # re-assignment of the same hash later on (e.g. after deletion) is unaffected.
         if torrent_hash and not is_torrent_file:
+            from database.torrent_tracking import get_torrent_history
             try:
                 history = get_torrent_history(torrent_hash)
             except Exception:
@@ -1510,12 +1158,12 @@ def confirm_manual_assignment():
 
                         if seasons_data:
                             metadata['seasons'] = {}
-                            # Convert integer keys from Trakt to string keys
+                            # Convert integer keys to string keys
                             for sn, si in seasons_data.items():
                                 metadata['seasons'][sn] = {'episodes': si.get('episodes', {}), 'episode_count': len(si.get('episodes', {}))}
                         else:
                             logging.warning(f"No season data fetched from any provider for {metadata.get('imdb_id')} in confirmation step")
-                    
+
                     # Use magnet_link if available, otherwise use None for torrent files
                     item_magnet_link = magnet_link if magnet_link else None
                     item_data = create_episode_item(metadata, title, year, version, final_torrent_id, item_magnet_link, season_number, episode_number)
@@ -1572,11 +1220,11 @@ def confirm_manual_assignment():
                         'content_source_detail': db_item.get('content_source_detail')
                     })
                     logging.info(f"Successfully added item {item_key} with file {selected_filename}, torrent ID: {final_torrent_id}")
-                    
+
                     # Prepare data for torrent tracking (only need one representative item)
                     if representative_tracking_item_data is None:
                         representative_tracking_item_data = {
-                            'title': db_item.get('title'), 'year': db_item.get('year'), 
+                            'title': db_item.get('title'), 'year': db_item.get('year'),
                             'media_type': db_item.get('type'), 'version': db_item.get('version'),
                             'tmdb_id': db_item.get('tmdb_id'), 'imdb_id': db_item.get('imdb_id'),
                             'filled_by_title': torrent_filename, 'filled_by_file': selected_filename, # Use filename here too
@@ -1728,8 +1376,18 @@ def create_episode_item(metadata, title, year, version, torrent_id, magnet_link,
 
     if first_aired_str:
         try:
-            # Parse the UTC datetime string (expecting format like 2023-10-26T18:00:00.000Z)
-            first_aired_utc = datetime.strptime(first_aired_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+            # Parse the UTC datetime string — Trakt sends "2023-10-26T18:00:00.000Z"
+            # (fractional seconds + Z), Scrob sends "2022-04-09T14:00:00" (no
+            # fractional seconds, no Z) — try both instead of assuming one source's
+            # format.
+            for _fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    first_aired_utc = datetime.strptime(first_aired_str, _fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError(f"time data {first_aired_str!r} does not match any known first_aired format")
             first_aired_utc = first_aired_utc.replace(tzinfo=timezone.utc)
 
             # Convert UTC to local timezone using the helper

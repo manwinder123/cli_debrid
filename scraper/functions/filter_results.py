@@ -106,6 +106,7 @@ def filter_results(
     filter_out = version_settings.get('filter_out', [])
     enable_hdr = version_settings.get('enable_hdr', False)
     disable_adult = get_setting('Scraping', 'disable_adult', False)
+    disable_nzb_season_packs = get_setting('Usenet Provider', 'disable_nzb_season_packs', False)
     
     #logging.debug(f"Starting filter_results with {len(results)} results")
     #logging.debug(f"Version settings: resolution={max_resolution}({resolution_wanted}), size={min_size_gb}-{max_size_gb}GB, HDR={enable_hdr}")
@@ -1563,6 +1564,15 @@ def filter_results(
                 
                 is_identified_as_pack = (season_pack_type_from_parse not in ['N/A', 'Unknown']) or \
                                         (len(parsed_episodes_list_from_parse) > 1)
+
+                # NZB season packs re-download the whole pack to repair a single damaged
+                # article, unlike per-episode/aggregate results which only re-grab the
+                # affected episode. When disabled, reject NZB packs outright rather than
+                # scoring/selecting them — movies and non-NZB (torrent) packs are unaffected.
+                if disable_nzb_season_packs and is_identified_as_pack and result.get('protocol') == 'nzb':
+                    result['filter_reason'] = "NZB season packs disabled"
+                    logging.info(f"Rejected: NZB season pack disabled by setting for '{original_title}' (Size: {result['size']:.2f}GB)")
+                    continue
 
                 # --- START: New Pack Wantedness Check ---
                 from database.database_reading import get_all_media_items
