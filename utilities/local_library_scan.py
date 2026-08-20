@@ -1190,6 +1190,57 @@ def _apply_nzb_naming(source_file: str, item: Dict[str, Any]) -> str:
         return source_file
 
 
+def _reject_unplayable_source(item: Dict[str, Any], is_nzb: bool) -> None:
+    """Mark a confirmed-unplayable file's source as not-wanted and revert the item
+    to Wanted so it gets rescraped, mirroring the existing missing-segments/
+    checking-timeout rejection pattern used elsewhere in the queue processing."""
+    try:
+        if is_nzb:
+            from database.not_wanted_magnets import add_to_not_wanted_nzb_guid
+            nzb_url = item.get('filled_by_magnet', '')
+            if nzb_url:
+                add_to_not_wanted_nzb_guid(nzb_url)
+        else:
+            from database.not_wanted_magnets import add_to_not_wanted, add_to_not_wanted_urls
+            from debrid.common import extract_hash_from_magnet
+            magnet = item.get('filled_by_magnet', '')
+            hash_value = extract_hash_from_magnet(magnet) if magnet else None
+            if hash_value:
+                add_to_not_wanted(hash_value)
+            # Also blacklist the raw URL itself (mirrors torrent_processor.py's
+            # add_to_not_wanted_urls alongside add_to_not_wanted). Needed because
+            # `magnet` here is frequently an unresolved Jackett indexer redirect
+            # link, not a real magnet: URI — is_magnet_not_wanted's hash-based
+            # comparison can never match that at scrape-filter time (it doesn't
+            # follow redirects), so a re-scrape can pick the exact same broken
+            # torrent again via a different indexer wrapping the same release.
+            # is_url_not_wanted is already checked everywhere is_magnet_not_wanted
+            # is, and both indexer links for the same release carry the same
+            # `file=` query param, so this closes the gap using the matching
+            # mechanism that already exists for it — no changes needed to the
+            # comparison logic itself.
+            if magnet and magnet.startswith('http'):
+                add_to_not_wanted_urls(magnet)
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to add unplayable source to not-wanted: {e}")
+
+    # not_wanted only stops a *fresh scrape* from picking this release again -
+    # sibling-reuse (debrid and NZB) picks a candidate straight from a known
+    # torrent_id without ever consulting it, so without this a sibling episode
+    # would keep reusing (and re-failing) this exact torrent for the rest of
+    # the season. See utilities/session_bad_torrents.py.
+    try:
+        from utilities.session_bad_torrents import mark_torrent_unplayable
+        mark_torrent_unplayable(item.get('filled_by_torrent_id'), item.get('filled_by_file'))
+    except Exception as e:
+        logging.warning(f"[ffprobe] Failed to mark torrent as known-unplayable: {e}")
+
+    try:
+        update_media_item_state(item.get('id'), 'Wanted')
+    except Exception as e:
+        logging.error(f"[ffprobe] Failed to revert item {item.get('id')} to Wanted after failed playability check: {e}")
+
+
 def _cleanup_old_symlink(item: Dict[str, Any], item_identifier: str, source_file: str, old_filename: str) -> None:
     """Remove the old symlink (and notify the media server) after a successful upgrade.
 
