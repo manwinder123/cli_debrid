@@ -276,7 +276,8 @@ class MediaMatcher:
             try:
                 _orig = ptt_result.get('original_filename', '') or ''
                 _tag = re.search(
-                    r'\bS\d{1,2}\s*[Ee]\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bSeason\s+\d{1,2}\b',
+                    r'\bS\d{1,2}\s*[Ee]\d{1,3}\b|\b\d{1,2}x\d{1,3}\b|\bSeason\s+\d{1,2}\b'
+                    r'|\bS\d{1,2}\s*[-–]\s*\d{1,3}\b',  # anime style: "Grand Blue S3 - 05"
                     _orig, re.IGNORECASE,
                 )
                 _prefix = _orig[: _tag.start()] if _tag else _orig
@@ -285,7 +286,13 @@ class MediaMatcher:
                     _r, _t = _prefix.lower(), series_title.lower()
                     _wr = set(re.findall(r'[a-z0-9]+', _r))
                     _wt = set(re.findall(r'[a-z0-9]+', _t))
-                    _word_ov = (len(_wr & _wt) / max(len(_wr), len(_wt))) if _wr and _wt else 0.0
+                    # Digit/letter confusables ("Pluribus" vs "PLUR1BUS"): fold
+                    # digits into their letter twins on BOTH sides before the
+                    # word-overlap test so leetspeak titles aren't rejected.
+                    _dig = str.maketrans('0134579', 'oieasgt')
+                    _wr_n = {w.translate(_dig) for w in _wr}
+                    _wt_n = {w.translate(_dig) for w in _wt}
+                    _word_ov = (len(_wr_n & _wt_n) / max(len(_wr_n), len(_wt_n))) if _wr_n and _wt_n else 0.0
                     _sim = max(_word_ov, fuzz.partial_ratio(_r, _t) / 100.0)
                     # When NO word of the source prefix appears in the wanted
                     # title, fuzzy partial ratios are noisy. Measured slips:
@@ -294,10 +301,36 @@ class MediaMatcher:
                     # 0.50 (passed 0.50). Short prefixes ('DMV' vs 'hey arnold'
                     # = 0.0) get the highest floor; legit short names still
                     # pass ('Doug' 0.75, 'Eek' 0.67, '24' via word overlap).
+                    #
+                    # HARDENING (2026-08-24): when the prefix has >=3 alnum
+                    # chars but shares NO confusable-folded word with the
+                    # wanted title AND its longest common token is tiny,
+                    # partial_ratio alone can still pass at 0.60 for short
+                    # prefixes. Require an actual shared word in that case.
                     if _word_ov == 0.0:
-                        _cutoff = 0.65 if _alnum < 6 else 0.60
+                        if _alnum < 6:
+                            _cutoff = 0.65
+                            _require_shared_word = False
+                        else:
+                            _cutoff = 0.60
+                            _require_shared_word = False
+                        # Extra floor: prefixes of >=8 alnum chars that share
+                        # zero words are essentially never right (measured:
+                        # 'ted.lasso.s04e02.repack' vs 'nanalan' = 0.08,
+                        # '[sam] grand blue' vs 'maggie...' = 0.13). Demand a
+                        # shared word regardless of fuzzy score.
+                        _require_shared_word = _alnum >= 8
                     else:
                         _cutoff = 0.20
+                        _require_shared_word = False
+                    if _require_shared_word and not (_wr_n & _wt_n):
+                        logging.warning(
+                            f"[MATCH-GUARD] Refusing episode match for '{series_title}' "
+                            f"S{target_season}E{target_episode}: source prefix "
+                            f"'{_prefix.strip()[:60]}' shares no title word "
+                            f"(len {_alnum}). Likely unrelated pack."
+                        )
+                        return False
                     if _sim < _cutoff:
                         logging.warning(
                             f"[MATCH-GUARD] Refusing episode match for '{series_title}' "
