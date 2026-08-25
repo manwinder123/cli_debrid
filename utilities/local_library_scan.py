@@ -807,7 +807,21 @@ def get_symlink_path(item: Dict[str, Any], original_file: str, skip_jikan_lookup
 
         template_vars = {
             'title': effective_title,
-            'year': item.get('year', ''),
+            # Local fix (2026-08-24): a NULL year must render as the show's real
+            # first-air year, never an empty string. An empty year makes the
+            # '{title} ({year})' template emit "Friends (None)"-style folders
+            # (Python renders None, or sanitize turns '' into a bare title that
+            # later diverges from the correctly-named library folder).
+            # Resolution order: item.year -> first 4-digit year found in any
+            # release name field -> 'Unknown'.
+            'year': (str(item.get('year')) if item.get('year') else
+                     (lambda m: m.group(1) if m else 'Unknown')(
+                         re.search(r'\b(19\d{2}|20\d{2})\b', ' '.join(filter(None, [
+                             str(item.get('original_scraped_torrent_title') or ''),
+                             str(item.get('real_debrid_original_title') or ''),
+                             str(item.get('filled_by_file') or ''),
+                             str(item.get('release_date') or ''),
+                         ]))))),
             'imdb_id': imdb_id,
             'tmdb_id': item.get('tmdb_id', ''),
             'version': item.get('version', '').strip('*'),  # Remove all asterisks for template placeholder use
