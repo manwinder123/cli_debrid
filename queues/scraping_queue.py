@@ -1018,6 +1018,67 @@ class ScrapingQueue:
                                     logging.debug(f"[ScrapingQueue] In-flight dedup check failed: {_inf_err}")
 
                         logging.info(f"Moving {item_identifier} to Adding queue with {len(filtered_results)} results")
+                        # --- PACK BATCH OPTIMIZATION (B): if this torrent is a season/complete pack,
+                        # reuse the same scrape results for other pending episodes of the same
+                        # show/season that are currently sitting in Scraping. This avoids N
+                        # sequential scrapes/adds for one pack (the user's complaint) and lets
+                        # AddingQueue's find_related_items coalesce them onto one debrid torrent.
+                        _pack_batched = 0
+                        try:
+                            if is_multi_pack and best_result:
+                                _parsed = best_result.get('parsed_info', {}) if isinstance(best_result.get('parsed_info'), dict) else {}
+                                _sei = _parsed.get('season_episode_info', {}) if isinstance(_parsed.get('season_episode_info'), dict) else {}
+                                _pack_type = _sei.get('season_pack')
+                                _sb = best_result.get('score_breakdown', {}) if isinstance(best_result.get('score_breakdown'), dict) else {}
+                                _num_items = _sb.get('num_items', 1) if isinstance(_sb.get('num_items'), int) else 1
+                                _is_pack = False
+                                _pack_seasons = set()
+                                if isinstance(_pack_type, str) and _pack_type not in ('N/A', 'Unknown', '', None):
+                                    _is_pack = True
+                                    if _pack_type.strip().lower() == 'complete':
+                                        _pack_seasons = set()  # empty means all seasons (complete)
+                                    else:
+                                        # e.g. "S01" or "S01,S02" or "S01, S02"
+                                        for _part in _pack_type.split(','):
+                                            _part = _part.strip().lstrip('S').lstrip('s')
+                                            if _part.isdigit():
+                                                try:
+                                                    _pack_seasons.add(int(_part))
+                                                except ValueError:
+                                                    pass
+                                        if not _pack_seasons:
+                                            # fallback: try to extract Sxx via regex
+                                            import re as _re_pack
+                                            for _m in _re_pack.finditer(r'S(\d{1,2})', _pack_type, flags=_re_pack.I):
+                                                try:
+                                                    _pack_seasons.add(int(_m.group(1)))
+                                                except ValueError:
+                                                    pass
+                                elif _num_items and _num_items > 1:
+                                    _is_pack = True
+                                # Also treat any torrent with many files as pack when title contains pack keywords
+                                # (covers Complete packs where PTT missed season_pack but size indicates pack)
+                                if not _is_pack:
+                                    _bt = (best_result.get('title') or '').lower()
+                                    if any(_k in _bt for _k in ('complete', 'season', 'series', 'collection')) and _num_items > 1:
+                                        _is_pack = True
+                                if _is_pack:
+                                    _imdb = item_to_process.get('imdb_id')
+                                    _ver = item_to_process.get('version')
+                                    _siblings = [it for it in list(self.items) if it.get('id') != item_to_process.get('id') and it.get('imdb_id') == _imdb and it.get('type') == 'episode' and (it.get('version') or '') == (_ver or '')]
+                                    if _pack_type and isinstance(_pack_type, str) and _pack_type.strip().lower() != 'complete' and _pack_seasons:
+                                        _siblings = [it for it in _siblings if it.get('season_number') in _pack_seasons]
+                                    # Cap batch to avoid overwhelming Adding (pack_reuse caps 30, we allow 50)
+                                    _batch_cap = 50
+                                    _siblings = _siblings[:_batch_cap]
+                                    if _siblings:
+                                        _preview = ", ".join("S%02dE%02d" % (s.get('season_number'), s.get('episode_number')) for s in _siblings[:6])
+                                        if len(_siblings) > 6:
+                                            _preview += "..."
+                                        logging.info("[PackBatch] '%s' pack_type=%r num_items=%s -> batching %s sibling(s) %s with same torrent" % (best_result.get('title','')[:60], _pack_type, _num_items, len(_siblings), _preview))
+                        except Exception as _pb_e:
+                            logging.debug("[PackBatch] pack detection skipped: %s" % _pb_e, exc_info=False)
+                            _siblings = []
                         try:
                             queue_manager.move_to_adding(item_to_process, "Scraping", best_result['title'], filtered_results)
                             self.reset_not_wanted_check(item_to_process['id'])
@@ -1025,6 +1086,26 @@ class ScrapingQueue:
                         except Exception as e:
                             logging.error(f"Failed to move {item_identifier} to Adding queue: {str(e)}", exc_info=True)
                             had_error = True
+                        # Execute batched siblings after primary move (so primary torrent_id exists for dedup)
+                        if not had_error and processed_successfully_or_moved and locals().get('_siblings'):
+                            for _sib in list(locals().get('_siblings', [])):
+                                if _sib.get('id') not in self._item_ids:
+                                    continue
+                                _sib_id = f"{_sib.get('title')} S{_sib.get('season_number'):02d}E{_sib.get('episode_number'):02d}"
+                                try:
+                                    queue_manager.move_to_adding(_sib, "Scraping", best_result['title'], filtered_results)
+                                    self.remove_item(_sib)
+                                    # reset_not_wanted_check expects int id
+                                    try:
+                                        self.reset_not_wanted_check(_sib['id'])
+                                    except Exception:
+                                        pass
+                                    _pack_batched += 1
+                                    logging.info(f"[PackBatch] batched {_sib_id} → Adding with same pack '{best_result.get('title','')[:50]}'")
+                                except Exception as _se:
+                                    logging.warning(f"[PackBatch] failed to batch {_sib_id}: {_se}")
+                            if _pack_batched:
+                                logging.info(f"[PackBatch] completed: { _pack_batched + 1 } episodes (primary + batched) queued for pack '{best_result.get('title','')[:60]}'")
             except Exception as e:
                 logging.error(f"Error processing item {item_identifier}: {str(e)}", exc_info=True)
                 try:
