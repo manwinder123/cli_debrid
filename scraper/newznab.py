@@ -78,6 +78,34 @@ def _cache_set(key: str, results: List) -> None:
         _NZB_CACHE[key] = (time.monotonic(), results)
 
 
+# Capabilities cache — which params each indexer's tv-search actually supports.
+# NZBGeek, for one, declares supportedParams="q,rid,tvdbid,tvmazeid,season,ep"
+# (no imdbid): its tvsearch silently returns 0 items for imdbid queries while
+# the identical content is found by text search. 257/257 imdbid tvsearches came
+# back empty over 12h of live logs before this check was added.
+_CAPS_CACHE: Dict[str, tuple] = {}   # base_url -> (timestamp, supported set | None)
+_CAPS_CACHE_TTL = 24 * 3600
+
+
+def _tv_search_supported_params(url: str, api_key: str) -> Optional[set]:
+    """Return the lowercase tv-search supportedParams set from t=caps, or None
+    when caps cannot be determined (callers keep current behaviour then)."""
+    base = url.rstrip('/')
+    with _NZB_CACHE_LOCK:
+        entry = _CAPS_CACHE.get(base)
+        if entry and (time.monotonic() - entry[0]) < _CAPS_CACHE_TTL:
+            return entry[1]
+    try:
+        r = api.get(f'{base}/api', params={'t': 'caps', 'apikey': api_key}, timeout=15)
+        m = re.search(r'<tv-search[^>]*supportedParams="([^"]*)"', r.text)
+        supported = set(p.strip().lower() for p in m.group(1).split(',')) if m else None
+    except Exception:
+        supported = None
+    with _NZB_CACHE_LOCK:
+        _CAPS_CACHE[base] = (time.monotonic(), supported)
+    return supported
+
+
 def _build_params_list(
     api_key: str,
     clean_imdb: str,
@@ -167,6 +195,17 @@ def scrape_newznab_instance(
     params_list = _build_params_list(
         api_key, clean_imdb, title, year, content_type, season, episode, multi
     )
+    # Drop ID-based tvsearches for indexers that don't declare imdbid support
+    # (e.g. NZBGeek): they return HTTP 200 with zero items, wasting half of
+    # every fan-out. The text query already covers the same content.
+    supported = _tv_search_supported_params(url, api_key)
+    if supported is not None and 'imdbid' not in supported:
+        dropped = [p for p in params_list if 'imdbid' in p]
+        if dropped:
+            logging.info(
+                f"Newznab '{instance}': tv-search caps lack imdbid support — "
+                f"dropping {len(dropped)} ID-based query(ies), using text search")
+            params_list = [p for p in params_list if 'imdbid' not in p]
 
     def _fetch(params):
         ck = _cache_key(endpoint, params)
