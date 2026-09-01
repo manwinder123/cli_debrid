@@ -1,10 +1,11 @@
 import logging
+import os
 import requests
 import smtplib
+from email.header import Header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from utilities.settings_schema import SETTINGS_SCHEMA
-from collections import defaultdict
 from datetime import datetime
 import time
 from threading import Timer, Lock
@@ -1019,10 +1020,39 @@ def _send_notifications(notifications, enabled_notifications, notification_categ
                     continue
 
                 try:
-                    # send_ntfy_notification doesn't explicitly return True/False
-                    # but logs success/failure. We'll assume success if no exception.
-                    send_ntfy_notification(host, api_key, priority, topic, content)
-                    send_result = True # Assume success if no exception
+                    # Resolve optional image/video attachment for NTFY.
+                    # Supports: external URL via Attach header, or local file upload.
+                    # - First check explicit fields in the notification payload (attach, image_url, poster_url, video_url)
+                    # - Then try to auto-resolve poster art for media items (TMDB)
+                    ntfy_attach = None
+                    ntfy_filename = None
+                    ntfy_title = None
+                    # content_input is the filtered list of dicts (or string for system msgs)
+                    try:
+                        ntfy_attach, ntfy_filename = _resolve_ntfy_attachment(content_input, notification_category)
+                    except Exception as e:
+                        logging.debug(f"NTFY attach resolve failed: {e}")
+                    # Derive a title from the first item for richer notifications
+                    try:
+                        if isinstance(content_input, list) and content_input and isinstance(content_input[0], dict):
+                            first = content_input[0]
+                            yr = first.get('year') or ''
+                            ttl = first.get('title') or topic
+                            if yr:
+                                ntfy_title = f"{ttl} ({yr})"
+                            else:
+                                ntfy_title = ttl
+                            # For multi-item batches, indicate count
+                            if len(content_input) > 1:
+                                ntfy_title = f"{ntfy_title} +{len(content_input)-1} more"
+                    except Exception:
+                        pass
+                    send_result = send_ntfy_notification(
+                        host, api_key, priority, topic, content,
+                        attach_url=ntfy_attach, filename=ntfy_filename, title=ntfy_title
+                    )
+                    if not send_result:
+                        logging.warning(f"<-- NTFY notification for {notification_id} FAILED (send returned False).")
                 except Exception as e:
                     logging.error(f"<-- NTFY notification for {notification_id} FAILED with exception: {str(e)}")
                     send_result = False
@@ -1256,22 +1286,302 @@ def send_email_notification(smtp_config, content, notification_category):
         logging.error(f"Failed to send email notification: {str(e)}", exc_info=True) # Add exc_info for detailed traceback
         return False # Indicate failure
 
-def send_ntfy_notification(host, api_key, priority, topic, content):
+def _normalize_ntfy_host(host: str) -> str:
+    """Normalize NTFY host to include scheme. Defaults to http:// for local hosts.
+    Handles docker quirks: ntfy:2586 inside container should be ntfy (port 80).
+    """
+    host = (host or "").strip()
+    if not host:
+        return host
+    # Fix docker service port quirk: ntfy listens on 80 inside docker network, not 2586
+    if host == "ntfy:2586":
+        host = "ntfy"
+    elif host.startswith("ntfy:2586/"):
+        host = "ntfy/" + host.split("/", 1)[1] if "/" in host else "ntfy"
+    if host.startswith("http://") or host.startswith("https://"):
+        # Also fix http://ntfy:2586 -> http://ntfy
+        if "://ntfy:2586" in host:
+            host = host.replace("://ntfy:2586", "://ntfy")
+        return host.rstrip("/")
+    # Default to http for local/private hosts; caller may pass full URL if https desired
+    if host.startswith("ntfy:2586"):
+        host = "ntfy" + host[len("ntfy:2586"):]
+    return "http://" + host.rstrip("/")
+
+def _encode_ntfy_header(value: str) -> str:
+    """Encode header value as RFC2047 if it contains non-latin1 characters (for ntfy Title/Message etc)."""
+    if value is None:
+        return ""
+    s = str(value)
+    try:
+        s.encode('latin-1')
+        return s
+    except UnicodeEncodeError:
+        # Encode as RFC2047 UTF-8 base64
+        return Header(s, 'utf-8').encode()
+def _resolve_ntfy_attachment(content_input, notification_category):
+    """
+    Try to resolve an image/video to attach to the NTFY notification.
+    Returns (attach_url_or_path, filename) or (None, None).
+    Priority:
+      1. Explicit attach/image_url/poster_url/video_url keys in the first item dict
+      2. Local poster file from poster_backups if available
+      3. Cached TMDB poster URL (https://image.tmdb.org/...)
+      4. None
+    """
+    # System categories have no media art
+    if notification_category in ('program_stop', 'program_crash', 'program_start', 'queue_pause', 'queue_resume', 'queue_start', 'queue_stop', 'program_info'):
+        return None, None
+    if not isinstance(content_input, list) or not content_input:
+        return None, None
+    first = content_input[0] if isinstance(content_input[0], dict) else None
+    if not first:
+        return None, None
+
+    # 1. Explicit attach fields
+    for key in ('attach', 'attach_url', 'image_url', 'poster_url', 'video_url', 'media_url', 'poster', 'image', 'thumbnail'):
+        val = first.get(key)
+        if isinstance(val, str) and val.strip():
+            val = val.strip()
+            # If it's already a full http URL, use as Attach
+            if val.startswith('http://') or val.startswith('https://'):
+                return val, first.get('filename')
+            # Relative TMDB path like /abc.jpg
+            if val.startswith('/') and len(val) > 2 and '.' in val:
+                return f"https://image.tmdb.org/t/p/w500{val}", None
+            # Local file path
+            if os.path.exists(val):
+                return val, os.path.basename(val)
+
+    # 2 & 3. Try DB lookup for tmdb_id -> poster
+    try:
+        item_id = first.get('id')
+        tmdb_id = first.get('tmdb_id')
+        media_type = first.get('type', 'movie')
+        # If we have an id but no tmdb_id, lookup
+        if item_id and not tmdb_id:
+            try:
+                from database import get_db_connection
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute('SELECT tmdb_id, imdb_id, type FROM media_items WHERE id=?', (item_id,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    tmdb_id, _imdb_id, db_type = row
+                    if db_type:
+                        media_type = db_type
+            except Exception as e:
+                logging.debug(f"NTFY poster DB lookup failed for id {item_id}: {e}")
+
+        if tmdb_id:
+            tmdb_id_str = str(tmdb_id).strip()
+            # Try poster cache first (fast, no network)
+            try:
+                from routes.poster_cache import get_cached_poster_url
+                cached = get_cached_poster_url(tmdb_id_str, media_type)
+                if cached and cached != "/static/images/placeholder.png":
+                    if cached.startswith('http://') or cached.startswith('https://'):
+                        return cached, None
+                    if cached.startswith('/') and len(cached) > 2:
+                        # Usually cached is like "/abc123.jpg" -> TMDB
+                        return f"https://image.tmdb.org/t/p/w500{cached}", None
+            except Exception as e:
+                logging.debug(f"NTFY poster cache miss for {tmdb_id_str}: {e}")
+
+            # Fallback: check local poster_backups dir for file existence -> upload as attachment
+            # We prefer external URL, but local file allows private networks
+            try:
+                import glob as _glob
+                # Inside cli_debrid container, posters are under /user/config/poster_backups
+                # On host, they are under /home/mdoodle/quickstack/config/cli_debrid/poster_backups
+                # Also check USER_DB_CONTENT fallback for completeness
+                candidate_dirs = []
+                # Container config dir
+                candidate_dirs.append("/user/config/poster_backups")
+                # Env-based db_content dir
+                db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+                candidate_dirs.append(os.path.join(db_content_dir, "poster_backups"))
+                # Host fallback (when running on host, not container)
+                candidate_dirs.append("/home/mdoodle/quickstack/config/cli_debrid/poster_backups")
+                # Also try relative to USER_DB_CONTENT parent
+                try:
+                    candidate_dirs.append(os.path.join(os.path.dirname(db_content_dir), "poster_backups"))
+                except Exception:
+                    pass
+                for d in candidate_dirs:
+                    for cand in _glob.glob(os.path.join(d, f"{tmdb_id_str}*.jpg")):
+                        if os.path.exists(cand) and os.path.getsize(cand) > 1024:
+                            return cand, os.path.basename(cand)
+                    for cand in _glob.glob(os.path.join(d, f"{tmdb_id_str}*.png")):
+                        if os.path.exists(cand) and os.path.getsize(cand) > 1024:
+                            return cand, os.path.basename(cand)
+            except Exception:
+                pass
+
+            # Last resort: try to fetch poster_path via DirectAPI (network) - best effort, short timeout
+            try:
+                # Use metadata helper if available
+                from routes.poster_cache import get_cached_poster_url as _gcp
+                # Attempt a lightweight TMDB fetch via direct_api if not cached
+                # We avoid heavy imports unless needed
+                from cli_battery.app.direct_api import DirectAPI as _DA
+                # Normalize media type for API
+                api_type = 'tv' if str(media_type).lower() in ('episode', 'show', 'tv', 'series') else 'movie'
+                # Try to get metadata; this may hit network but with timeout
+                meta = None
+                if api_type == 'tv':
+                    # DirectAPI.get_show_metadata expects imdb_id, but we have tmdb_id
+                    # Fall back to generic metadata lookup via search? Skip for now
+                    pass
+                else:
+                    # For movies we could try get_metadata with tmdb_id
+                    try:
+                        from metadata.metadata import get_metadata
+                        meta = get_metadata(tmdb_id=int(tmdb_id_str), item_media_type='movie')
+                        if meta and meta.get('poster'):
+                            pp = meta.get('poster')
+                            if isinstance(pp, str) and pp.strip():
+                                pp = pp.strip()
+                                if pp.startswith('/') :
+                                    return f"https://image.tmdb.org/t/p/w500{pp}", None
+                                if pp.startswith('http'):
+                                    return pp, None
+                    except Exception as e:
+                        logging.debug(f"NTFY get_metadata fallback failed: {e}")
+            except Exception:
+                pass
+    except Exception as e:
+        logging.debug(f"_resolve_ntfy_attachment outer failed: {e}")
+    return None, None
+
+def send_ntfy_notification(host, api_key, priority, topic, content, attach_url=None, filename=None, title=None, tags=None, click=None, icon=None, markdown=False):
+    """
+    Send NTFY notification with optional image/video attachment.
+    - attach_url: external http(s) URL (e.g. https://image.tmdb.org/t/p/w500/abc.jpg) -> sent as Attach header
+                  or local file path (e.g. /user/db_content/poster_backups/123.jpg) -> uploaded as file attachment
+    - filename: optional override filename for attachment (sent as Filename header)
+    - title: optional custom title (sent as Title header); if None, ntfy uses topic
+    - tags/icons/click: optional NTFY features
+    Backwards compatible: existing 5-arg calls still work.
+    Supports both http and https hosts; if host lacks scheme, http:// is assumed.
+    """
     if not priority:
         priority = "low"
-    headers={
-                "Icon": "https://raw.githubusercontent.com/godver3/cli_debrid/refs/heads/main/static/white-icon-32x32.png",
-                "Priority": priority
-            }
+    # Normalize host
+    base = _normalize_ntfy_host(host)
+    if not base or not topic:
+        logging.error("NTFY: missing host or topic")
+        return False
+    topic_url = f"{base}/{topic.lstrip('/')}"
+
+    # Default icon
+    if icon is None:
+        icon = "https://raw.githubusercontent.com/godver3/cli_debrid/refs/heads/main/static/white-icon-32x32.png"
+
+    headers = {
+        "Icon": icon,
+        "Priority": str(priority),
+    }
     if api_key:
-        headers["Authorization"]= f"Bearer {api_key}"
-    try:
-        response = requests.post(f"https://{host}/{topic}",
-            data= (content).encode('utf-8'),
-            headers=headers)
-        response.raise_for_status()
-    except Exception as e:
-        logging.error(f"Failed to send NTFY notification: {str(e)}")
+        headers["Authorization"] = f"Bearer {api_key}"
+    if title:
+        headers["Title"] = _encode_ntfy_header(str(title)[:200])
+    if tags:
+        # tags can be list or comma string
+        if isinstance(tags, (list, tuple)):
+            headers["Tags"] = ",".join(str(t) for t in tags)
+        else:
+            headers["Tags"] = str(tags)
+    if click:
+        headers["Click"] = str(click)
+    if markdown:
+        headers["Markdown"] = "yes"
+    # Handle attachment
+    attach_is_local_file = False
+    attach_path = None
+    if attach_url:
+        # Distinguish local file vs remote URL
+        if isinstance(attach_url, str) and (attach_url.startswith("http://") or attach_url.startswith("https://")):
+            headers["Attach"] = attach_url
+            if filename:
+                headers["Filename"] = str(filename)
+            else:
+                # Try to derive filename from URL
+                try:
+                    from urllib.parse import urlparse
+                    fn = os.path.basename(urlparse(attach_url).path)
+                    if fn and "." in fn:
+                        headers["Filename"] = fn
+                except Exception:
+                    pass
+        elif isinstance(attach_url, str) and os.path.exists(attach_url):
+            attach_is_local_file = True
+            attach_path = attach_url
+            if not filename:
+                filename = os.path.basename(attach_path)
+            headers["Filename"] = str(filename)
+        else:
+            logging.debug(f"NTFY attach ignored (not URL nor existing file): {attach_url}")
+
+    # Build candidate URLs for fallback (docker networking quirks)
+    candidates = [topic_url]
+    # If original was ntfy:2586 variant, we already normalized to ntfy, but keep explicit fallback
+    if base == "http://ntfy:2586":
+        candidates.append(f"http://ntfy/{topic.lstrip('/')}")
+    # Inside container, 127.0.0.1:2586 will fail; try ntfy as fallback
+    if "127.0.0.1" in base or "192.168." in base:
+        candidates.append(f"http://ntfy/{topic.lstrip('/')}")
+    # On host, ntfy may fail; try host loopback
+    if base == "http://ntfy":
+        candidates.append(f"http://127.0.0.1:2586/{topic.lstrip('/')}")
+        candidates.append(f"http://192.168.50.37:2586/{topic.lstrip('/')}")
+    # Dedupe while preserving order
+    seen = set()
+    uniq_candidates = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq_candidates.append(c)
+
+    last_exc = None
+    for cand_url in uniq_candidates:
+        try:
+            if attach_is_local_file and attach_path:
+                # Upload local file as attachment body; message goes in X-Message header
+                try:
+                    with open(attach_path, 'rb') as f:
+                        file_bytes = f.read()
+                    if not file_bytes:
+                        logging.warning(f"NTFY local attach file empty: {attach_path}")
+                        response = requests.post(cand_url, data=(content or "").encode('utf-8'), headers=headers, timeout=15)
+                    else:
+                        if content:
+                            msg = content if len(content) < 4000 else content[:4000] + " …"
+                            headers["Message"] = _encode_ntfy_header(msg)
+                        response = requests.post(cand_url, data=file_bytes, headers=headers, timeout=30)
+                    response.raise_for_status()
+                    logging.info(f"NTFY sent with local file attach {filename} to {cand_url}")
+                    return True
+                except Exception as e:
+                    last_exc = e
+                    logging.debug(f"NTFY local attach attempt to {cand_url} failed: {e}")
+                    headers.pop("Message", None)
+                    continue
+            else:
+                response = requests.post(cand_url, data=(content or "").encode('utf-8'), headers=headers, timeout=15)
+                response.raise_for_status()
+                if attach_url and not attach_is_local_file:
+                    logging.info(f"NTFY sent to {cand_url} with external attach {attach_url}")
+                else:
+                    logging.debug(f"NTFY sent to {cand_url} (no attach)")
+                return True
+        except Exception as e:
+            last_exc = e
+            logging.debug(f"NTFY attempt to {cand_url} failed: {e}")
+            continue
+    logging.error(f"Failed to send NTFY notification after {len(uniq_candidates)} attempts: {last_exc}")
+    return False
 
 def send_telegram_notification(bot_token, chat_id, content):
     MAX_RETRIES = 3

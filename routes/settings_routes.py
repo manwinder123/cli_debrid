@@ -3181,13 +3181,29 @@ def test_notification():
                 if not notification_config.get('host') or not notification_config.get('topic'):
                     return jsonify({'success': False, 'error': 'Missing NTFY configuration'}), 400
                 
-                content = "Test Notification\n\nThis is a test message from CLI Debrid. If you're seeing this, your NTFY notifications are working correctly!"
+                content = "Test Notification\n\nThis is a test message from CLI Debrid. If you're seeing this, your NTFY notifications are working correctly!\n\n🖼️ Image attachment test: poster should appear below if your client supports images."
+                # Include a sample TMDB poster as external attachment for verification
+                # Users can replace this with any http(s) image/video URL or a local file path
+                sample_image = "https://image.tmdb.org/t/p/w500/qW4crfED8mpNDadSmMdi7ZDzhXF.jpg"
+                # Also test local file fallback if sample_image unreachable: try local poster_backups if exists
+                try:
+                    import glob
+                    db_content = os.environ.get('USER_DB_CONTENT', '/user/db_content')
+                    local_candidates = glob.glob(os.path.join(db_content, "poster_backups", "*.jpg"))
+                    # Prefer first local file if exists and sample not desired
+                    # Keep sample_image as default; local path would be used as file upload alternative:
+                    # sample_image = local_candidates[0] if local_candidates else sample_image
+                    pass
+                except Exception:
+                    pass
                 send_ntfy_notification(
                     notification_config['host'],
                     notification_config.get('api_key', ''),
                     notification_config.get('priority', 'low'),
                     notification_config['topic'],
-                    content
+                    content,
+                    attach_url=sample_image,
+                    title="CLI Debrid Test (with image)"
                 )
                 success = True
                 
