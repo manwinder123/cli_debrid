@@ -466,6 +466,10 @@ class QueueManager:
         return processed > 0
 
     def process_adding(self):
+        # Adding runs more frequently than the queue-view refresh. Refresh here
+        # so health-check resets are not held in memory for up to 30 seconds;
+        # AddingQueue also revalidates each row immediately before submission.
+        self.queues["Adding"].update()
         self._process_queue_safely("Adding")
 
     def process_unreleased(self):

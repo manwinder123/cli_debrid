@@ -289,6 +289,29 @@ class AddingQueue:
             if not item_id:
                 logging.warning(f"Skipping item without ID in AddingQueue: {item.get('title')}")
                 continue
+            # Health-check and queue-view tasks can reset an item between the
+            # initial snapshot above and this loop. Re-read the row before
+            # selecting a release; otherwise a just-failed NZB can be
+            # submitted again from stale scrape_results before update() runs.
+            try:
+                fresh_item = get_media_item_by_id(item_id)
+            except Exception as _fresh_err:
+                logging.debug(f"Could not refresh Adding item {item_id}: {_fresh_err}")
+                fresh_item = None
+            if not fresh_item or fresh_item.get('state') != 'Adding':
+                self.remove_item(item)
+                continue
+            if any(fresh_item.get(_key) != item.get(_key) for _key in (
+                'filled_by_torrent_id', 'filled_by_magnet', 'filled_by_file',
+                'filled_by_title', 'scrape_results')):
+                item = dict(fresh_item)
+                for _idx, _queued in enumerate(self.items):
+                    if _queued.get('id') == item_id:
+                        self.items[_idx] = item
+                        break
+                if str(item.get('filled_by_torrent_id', '')).startswith('nzb:'):
+                    continue
+
 
             # Skip NZB items already submitted to cli_mount — handled by health check loop above.
             # Tick counter only increments for items NOT yet submitted (no nzb: torrent_id).

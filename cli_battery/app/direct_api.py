@@ -665,6 +665,11 @@ class DirectAPI:
                     logging.debug(f"get_movie_metadata {imdb_id}: cache HIT")
                     return _build_metadata_dict(item), 'battery'
 
+                # Capture fallback before _refresh_movie mutates/deletes ORM
+                # metadata rows. Its flush can expire the relationship, so
+                # rebuilding from the now-detached item on the failure path
+                # raises instead of returning stale data.
+                fallback_md = _build_metadata_dict(item) if item else None
                 # Stale or missing — refresh, unless Trakt is in cooldown
                 logging.debug(f"get_movie_metadata {imdb_id}: cache MISS (stale={item is not None})")
                 if item:
@@ -673,7 +678,7 @@ class DirectAPI:
                         from datetime import datetime as _dt
                         _coord = GlobalTraktCoordinator.get_instance()
                         if _coord._global_cooldown_until and _dt.now() < _coord._global_cooldown_until:
-                            return _build_metadata_dict(item), 'battery'
+                            return fallback_md, 'battery'
                     except Exception:
                         pass
                 data = _refresh_movie(imdb_id, session)
@@ -681,8 +686,8 @@ class DirectAPI:
                     return data, _get_metadata_source_name()
 
                 # Trakt failed but we have stale data
-                if item:
-                    return _build_metadata_dict(item), 'battery'
+                if fallback_md is not None:
+                    return fallback_md, 'battery'
                 return None, None
         except Exception as e:
             logging.error(f"DirectAPI.get_movie_metadata {imdb_id}: {e}", exc_info=True)
