@@ -282,7 +282,17 @@ def filter_results(
             simple_parsed = re.sub(r'[^a-z0-9]', '', normalized_parsed_title) if normalized_parsed_title else None
             
             # --- Main Title Similarity ---
-            main_sim_set = fuzz.token_set_ratio(normalized_result_title, normalized_query_title) / 100.0
+            # token_set_ratio needs whitespace-separated tokens. normalize_title
+            # emits dot-joined text, so a single-word title ("seinfeld") and the
+            # full release name each collapse into ONE token and the set
+            # similarity degenerates to a plain string ratio (~0.5) — rejecting
+            # every long release of a single-word show. Whitespace tokens
+            # restore the intended subset semantics (multi-word queries already
+            # behaved this way).
+            main_sim_set = fuzz.token_set_ratio(
+                normalized_result_title.replace('.', ' '),
+                normalized_query_title.replace('.', ' '),
+            ) / 100.0
             if normalized_parsed_title:
                 main_sim_sort = fuzz.token_sort_ratio(normalized_parsed_title, normalized_query_title) / 100.0
                 main_title_sim = (main_sim_set + main_sim_sort) / 2.0
@@ -435,7 +445,12 @@ def filter_results(
             # --- Translated Title Similarity ---
             translated_title_sim = 0.0
             if normalized_translated_title:
-                trans_sim_set = fuzz.token_set_ratio(normalized_result_title, normalized_translated_title) / 100.0
+                # Whitespace-token view (see main_sim_set above): the raw result
+                # title is one dotted token after normalization.
+                trans_sim_set = fuzz.token_set_ratio(
+                    normalized_result_title.replace('.', ' '),
+                    normalized_translated_title.replace('.', ' '),
+                ) / 100.0
                 if normalized_parsed_title:
                     trans_sim_sort = fuzz.token_sort_ratio(normalized_parsed_title, normalized_translated_title) / 100.0
                     translated_title_sim = (trans_sim_set + trans_sim_sort) / 2.0
