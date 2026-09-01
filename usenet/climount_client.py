@@ -15,6 +15,8 @@ import logging
 import os
 import re
 import time
+import threading
+from collections import deque
 from typing import Optional, Dict, Any, Tuple
 
 from utilities.settings import get_setting
@@ -819,6 +821,31 @@ def _map_state(raw: str) -> str:
 
 _client_instance = None
 
+# A provider may acknowledge deletion asynchronously and keep a completed
+# entry queryable for a short time. Remember recently failed IDs so same-process
+# title/pack dedup cannot immediately reattach to that stale entry. The deque
+# bounds memory; persistent source quarantine handles process restarts.
+_dead_nzb_jobs = set()
+_dead_nzb_job_order = deque(maxlen=2048)
+_dead_nzb_jobs_lock = threading.Lock()
+
+
+def mark_nzb_job_dead(job_hash: str) -> None:
+    """Prevent reuse of a provider job known to have failed this run."""
+    normalized = str(job_hash or '').strip()
+    if normalized.startswith('nzb:'):
+        normalized = normalized[4:]
+    if not normalized:
+        return
+    with _dead_nzb_jobs_lock:
+        if normalized in _dead_nzb_jobs:
+            return
+        if len(_dead_nzb_job_order) == _dead_nzb_job_order.maxlen:
+            _dead_nzb_jobs.discard(_dead_nzb_job_order.popleft())
+        _dead_nzb_job_order.append(normalized)
+        _dead_nzb_jobs.add(normalized)
+    logging.info(f'[NZB] Quarantined failed provider job {normalized!r} for this process')
+
 
 def _provider_key() -> str:
     try:
@@ -853,9 +880,29 @@ def is_nzb_job_alive(job_hash: str) -> bool:
 
     @timed_lru_cache(seconds=20)
     def _check(_job_hash: str) -> bool:
+        normalized = str(_job_hash or '').strip()
+        if normalized.startswith('nzb:'):
+            normalized = normalized[4:]
+        with _dead_nzb_jobs_lock:
+            if normalized in _dead_nzb_jobs:
+                return False
         try:
             status = get_climount_client().get_job_status(_job_hash)
-            return bool(status and status.get('raw'))
+            if not status:
+                # A provider/API error is unknown, not proof that the job died.
+                return True
+            raw = status.get('raw') or {}
+            if not raw:
+                # get_job_status uses an empty raw object for a missing or
+                # already-cleaned entry. Reusing that ID creates a ghost job.
+                return False
+            state = str(status.get('state') or '').lower()
+            raw_state = str(raw.get('state') or raw.get('status') or '').lower()
+            if state in ('failed', 'error', 'bad') or raw_state in ('failed', 'error', 'bad'):
+                # Failed entries remain queryable in cli_mount; presence alone
+                # must not make the queue reuse a known-dead NZB.
+                return False
+            return True
         except Exception as exc:
             logging.debug(f'[cli_mount] is_nzb_job_alive check failed for {_job_hash!r}: {exc}')
             # Unknown due to a transient error - don't block a legitimate reuse over it.

@@ -1,7 +1,9 @@
 import pickle
 import os
 import re
+import tempfile
 import logging
+import fcntl
 from utilities.settings import get_setting
 
 
@@ -26,6 +28,47 @@ DB_CONTENT_DIR = os.environ.get('USER_DB_CONTENT', '/user/db_content')
 # Update the paths to use the environment variable
 NOT_WANTED_MAGNETS_FILE = os.path.join(DB_CONTENT_DIR, 'not_wanted_magnets.pkl')
 NOT_WANTED_URLS_FILE = os.path.join(DB_CONTENT_DIR, 'not_wanted_urls.pkl')
+
+def _atomic_pickle_save(path, value):
+    """Write a complete pickle and publish it with one atomic rename."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix='.not-wanted-', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _add_to_pickle_set(path, value, label):
+    """Serialize load/add/save across queue threads and helper processes."""
+    lock_path = path + '.lock'
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    normalized = value.strip().strip('<>').lower()
+    with open(lock_path, 'a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            try:
+                with open(path, 'rb') as f:
+                    values = pickle.load(f)
+            except (EOFError, pickle.UnpicklingError, FileNotFoundError):
+                values = set()
+            if not isinstance(values, set):
+                values = set(values)
+            if normalized in values:
+                return
+            values.add(normalized)
+            _atomic_pickle_save(path, values)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    logging.info(f'[NZB] Added broken NZB {label} {value!r} to not-wanted list')
 NOT_WANTED_NZB_SEGMENTS_FILE = os.path.join(DB_CONTENT_DIR, 'not_wanted_nzb_segments.pkl')
 NOT_WANTED_NZB_GUIDS_FILE = os.path.join(DB_CONTENT_DIR, 'not_wanted_nzb_guids.pkl')
 
@@ -58,18 +101,13 @@ def load_not_wanted_nzb_segments():
 
 
 def save_not_wanted_nzb_segments(s):
-    os.makedirs(os.path.dirname(NOT_WANTED_NZB_SEGMENTS_FILE), exist_ok=True)
-    with open(NOT_WANTED_NZB_SEGMENTS_FILE, 'wb') as f:
-        pickle.dump(s, f)
+    _atomic_pickle_save(NOT_WANTED_NZB_SEGMENTS_FILE, s)
 
 
 def add_to_not_wanted_nzb_segment(segment_id: str):
     if not segment_id:
         return
-    s = load_not_wanted_nzb_segments()
-    s.add(segment_id.strip().strip('<>').lower())
-    save_not_wanted_nzb_segments(s)
-    logging.info(f'[NZB] Added broken NZB segment ID {segment_id!r} to not-wanted list')
+    _add_to_pickle_set(NOT_WANTED_NZB_SEGMENTS_FILE, segment_id, 'segment ID')
 
 
 def is_nzb_segment_not_wanted(nzb_xml: str) -> bool:
@@ -130,20 +168,14 @@ def load_not_wanted_nzb_guids():
 
 
 def save_not_wanted_nzb_guids(s):
-    os.makedirs(os.path.dirname(NOT_WANTED_NZB_GUIDS_FILE), exist_ok=True)
-    with open(NOT_WANTED_NZB_GUIDS_FILE, 'wb') as f:
-        pickle.dump(s, f)
+    _atomic_pickle_save(NOT_WANTED_NZB_GUIDS_FILE, s)
 
 
 def add_to_not_wanted_nzb_guid(url_or_guid: str):
     guid = extract_nzb_guid(url_or_guid)
     if not guid:
         return
-    s = load_not_wanted_nzb_guids()
-    if guid not in s:
-        s.add(guid)
-        save_not_wanted_nzb_guids(s)
-        logging.info(f'[NZB] Added broken NZB guid {guid!r} to not-wanted list')
+    _add_to_pickle_set(NOT_WANTED_NZB_GUIDS_FILE, guid, 'guid')
 
 
 def is_nzb_guid_not_wanted(url_or_guid: str) -> bool:

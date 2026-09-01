@@ -3599,6 +3599,11 @@ class ProgramRunner:
                         # because the dedup check would just re-assign the same dead hash.
                         logging.warning(f'[NZB] {torrent_id} is a ghost job — moving all items with this job to Wanted')
                         try:
+                            from usenet.climount_client import mark_nzb_job_dead as _mark_nzb_job_dead
+                            _mark_nzb_job_dead(job_id)
+                        except Exception as _dead_mark_err:
+                            logging.debug(f'[NZB] Could not mark ghost job {job_id} dead: {_dead_mark_err}')
+                        try:
                             from database.not_wanted_magnets import add_to_not_wanted_nzb_guid as _add_guid_g
                             _nzb_url_g = item.get('filled_by_magnet', '')
                             if _nzb_url_g:
@@ -3624,6 +3629,11 @@ class ProgramRunner:
                     elif progress == -1:
                         logging.warning(f'[NZB] {torrent_id} failed in cli_mount — adding to not-wanted and moving back to Scraping')
                         try:
+                            from usenet.climount_client import mark_nzb_job_dead as _mark_nzb_job_dead
+                            _mark_nzb_job_dead(torrent_id)
+                        except Exception as _dead_mark_err:
+                            logging.debug(f'[NZB] Could not mark failed job {torrent_id} dead: {_dead_mark_err}')
+                        try:
                             from database.not_wanted_magnets import add_to_not_wanted_nzb_guid as _add_guid, add_to_not_wanted_nzb_segment as _add_seg
                             _nzb_url = item.get('filled_by_magnet', '')
                             if _nzb_url:
@@ -3648,6 +3658,9 @@ class ProgramRunner:
                                     _ds_url = _ds.get('filled_by_magnet', '')
                                     if _ds_url:
                                         _add_guid(_ds_url)
+                                    _ds_seg = _ds.get('nzb_segment_id') or _ds.get('_nzb_segment_id') or ''
+                                    if _ds_seg:
+                                        _add_seg(_ds_seg)
                                     self.queue_manager.move_to_wanted(_ds, 'Adding')
                                     logging.info(f'[NZB] Cleaned up dead sibling {_ds["id"]} from Adding')
                                 except Exception:
@@ -3663,9 +3676,14 @@ class ProgramRunner:
                             _sr = item.get('scrape_results', [])
                             if isinstance(_sr, str):
                                 _sr = _json.loads(_sr)
-                            # Filter out the bad URL from remaining results
+                            # Only remove the failed URL from this in-memory
+                            # result list. Scrape results do not carry extracted
+                            # segment IDs yet; equivalent NZBs are rejected by
+                            # torrent_processor's persistent segment/GUID gate
+                            # when their XML is fetched before submission.
+                            _failed_url = item.get('filled_by_magnet', '')
                             _remaining = [r for r in (_sr or [])
-                                          if (r.get('nzb_url') or r.get('magnet', '')) != item.get('filled_by_magnet', '')]
+                                          if (r.get('nzb_url') or r.get('magnet', '')) != _failed_url]
                             if _remaining:
                                 _has_more_results = True
                                 # Delete the broken job from cli_mount so prefix-match in

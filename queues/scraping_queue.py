@@ -19,7 +19,11 @@ class ScrapingQueue:
         self.items = []
         # Use a set for efficient ID lookup of in-memory items
         self._item_ids = set()
-
+        # A sibling in Adding is expected to be temporary. Keep deferred
+        # items out of the front of the queue across update() calls; update()
+        # rebuilds and re-sorts from SQLite, so rotate-only deferral otherwise
+        # returns the same sibling group to index zero every second forever.
+        self._deferred_until = {}
     def update(self):
         """Synchronize the in-memory queue with the database state."""
         from database import get_all_media_items, get_media_item_by_id
@@ -150,6 +154,15 @@ class ScrapingQueue:
         # Assumes force_priority is a boolean or integer (0/1).
         # `not item.get('force_priority', False)` makes True values (forced) sort before False values.
         self.items.sort(key=lambda item: not item.get('force_priority', False))
+        # Keep temporarily deferred siblings behind independent work. This
+        # sort must run after force-priority sorting so a blocked low-ID show
+        # cannot starve every other show while its Adding sibling is wedged.
+        _now = time.time()
+        self._deferred_until = {
+            item_id: until for item_id, until in self._deferred_until.items()
+            if until > _now and item_id in self._item_ids
+        }
+        self.items.sort(key=lambda item: item.get('id') in self._deferred_until)
 
         # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID_UPDATE}] After all sorting in ScrapingQueue.update():")
         if self.items:
@@ -364,16 +377,15 @@ class ScrapingQueue:
                                 # logging.info(f"[DEBUG_ITEM_{DEBUG_ITEM_ID}] DEFERRED - related item found in Adding Queue.")
                                 pass
                             # Defer this item (a sibling is being added — avoid
-                            # duplicate adds), but ROTATE it to the back instead
-                            # of returning False. Returning False made the batch
-                            # loop in queue_manager.process_scraping() break,
-                            # starving the ENTIRE queue behind this one item when
-                            # it sat at index 0 (the queue sorts by imdb_id, so a
-                            # stuck Adding sibling with a low tt-id blocked every
-                            # other show indefinitely).
-                            logging.info(
+                            # duplicate adds). Persist the deferral across the
+                            # next SQLite refresh; a rotate-only change is lost
+                            # because update() sorts from DB on every tick.
+                            self._deferred_until[item_id_being_processed] = (
+                                time.time() + 60
+                            )
+                            logging.debug(
                                 f"Deferring {item_identifier} (sibling in Adding), "
-                                f"rotating to back of queue"
+                                f"retrying after 60s"
                             )
                             processed_successfully_or_moved = True
                             if self.items and self.items[0].get('id') == item_id_being_processed:

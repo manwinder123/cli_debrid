@@ -979,6 +979,18 @@ class TorrentProcessor:
         if not nzb_url:
             logging.warning(f'[{item_identifier}] NZB result has no URL, skipping')
             return None
+        # Do this before any provider-title or sibling dedup. cli_mount can
+        # acknowledge deletion asynchronously and keep a completed-looking
+        # entry queryable; reusing it would bypass the persistent GUID/segment
+        # quarantine for the failed source.
+        try:
+            from database.not_wanted_magnets import is_nzb_guid_not_wanted as _is_nzb_guid_not_wanted
+            if _is_nzb_guid_not_wanted(nzb_url):
+                logging.info(f'[{item_identifier}] Skipping NZB {title!r} — GUID is in not-wanted list')
+                return None
+        except Exception as _nzb_guid_check_err:
+            logging.debug(f'[{item_identifier}] Could not pre-check NZB GUID: {_nzb_guid_check_err}')
+
 
         # Equivalent of debrid's _all_torrent_ids check: if another episode of the same
         # show/season already has an NZB job (in any active or completed state), reuse it
@@ -1226,10 +1238,22 @@ class TorrentProcessor:
                     _dd_row = _dbc.execute(_dd_q, _dd_p).fetchone()
                 if _dd_row:
                     _existing_nzb_id = _dd_row[0][4:]  # strip 'nzb:'
-                    logging.info(f'[{item_identifier}] NZB already in-flight (DB dedup): {_existing_nzb_id} — reusing job')
-                    return {'id': _existing_nzb_id, 'filename': job_title, 'original_title': job_title,
-                            'status': 'downloading', 'files': [], 'progress': 0,
-                            '_provider': 'Usenet', '_is_nzb': True, '_nzb_url': nzb_url}, nzb_url, result
+                    try:
+                        from usenet.climount_client import is_nzb_job_alive as _is_nzb_job_alive
+                        if not _is_nzb_job_alive(_existing_nzb_id):
+                            logging.info(f'[{item_identifier}] NZB DB dedup points at dead job: {_existing_nzb_id} — ignoring stale reference')
+                        else:
+                            logging.info(f'[{item_identifier}] NZB already in-flight (DB dedup): {_existing_nzb_id} — reusing job')
+                            return {'id': _existing_nzb_id, 'filename': job_title, 'original_title': job_title,
+                                    'status': 'downloading', 'files': [], 'progress': 0,
+                                    '_provider': 'Usenet', '_is_nzb': True, '_nzb_url': nzb_url}, nzb_url, result
+                    except Exception:
+                        # Preserve the existing dedup behavior if the optional
+                        # provider liveness probe cannot be imported.
+                        logging.info(f'[{item_identifier}] NZB already in-flight (DB dedup): {_existing_nzb_id} — reusing job')
+                        return {'id': _existing_nzb_id, 'filename': job_title, 'original_title': job_title,
+                                'status': 'downloading', 'files': [], 'progress': 0,
+                                '_provider': 'Usenet', '_is_nzb': True, '_nzb_url': nzb_url}, nzb_url, result
         except Exception:
             pass
 
@@ -1258,7 +1282,19 @@ class TorrentProcessor:
                     _prefix = (bool(_job_prefix) and _title_prefix(_t_name) == _job_prefix)
                     if _exact or _prefix:
                         _existing_hash = _t.get('info_hash', '')
+                        if not _existing_hash:
+                            continue
                         _match_type = 'exact' if _exact else 'prefix'
+                        try:
+                            from usenet.climount_client import is_nzb_job_alive as _is_nzb_job_alive
+                            if not _is_nzb_job_alive(_existing_hash):
+                                logging.info(f'[{item_identifier}] cli_mount {_match_type} match is dead: {_existing_hash} — ignoring stale job')
+                                continue
+                        except Exception:
+                            # A liveness probe failure must not disable the
+                            # existing dedup path; the helper itself treats
+                            # provider/API errors as unknown and reusable.
+                            pass
                         logging.info(f'[{item_identifier}] NZB already in cli_mount ({_match_type} match): {_t_name} (hash={_existing_hash}) — reusing job')
                         _found_dc = True
                         return {'id': _existing_hash, 'filename': job_title, 'original_title': job_title,

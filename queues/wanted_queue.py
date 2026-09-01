@@ -12,7 +12,11 @@ from database.database_writing import update_media_item_state, update_blackliste
 # Define constants for queue size limits
 SCRAPING_QUEUE_MAX_SIZE = 500
 # New threshold to pause Wanted processing entirely
-WANTED_THROTTLE_SCRAPING_SIZE = 100
+# Raised 2026-08-31 for the usenet backfill goal (blacklisted/ghostlisted
+# shows -> usenet pipeline). 300 starved the old-show backlog behind the
+# scrape queue; 2000 lets the backfill intake run while scraping_streams
+# still rate-limit per indexer.
+WANTED_THROTTLE_SCRAPING_SIZE = 2000
 
 class WantedQueue:
     def __init__(self):
