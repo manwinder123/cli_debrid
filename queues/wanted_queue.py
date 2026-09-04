@@ -362,7 +362,7 @@ class WantedQueue:
                                 "SELECT * FROM media_items WHERE state = 'Wanted' "
                                 "AND (ghostlisted IS NULL OR ghostlisted = 0) "
                                 "AND type = ? AND release_date >= date('now', '-' || ? || ' days') "
-                                "ORDER BY release_date DESC LIMIT ?",
+                                "ORDER BY blacklist_count ASC, release_date DESC LIMIT ?",
                                 (fresh_type, freshness_window, freshness_cap),
                             )
                             fresh_items = [dict(row) for row in cursor_fresh.fetchall()]
