@@ -1394,7 +1394,6 @@ def _resolve_ntfy_attachment(content_input, notification_category):
             try:
                 import glob as _glob
                 # Inside cli_debrid container, posters are under /user/config/poster_backups
-                # On host, they are under /home/mdoodle/quickstack/config/cli_debrid/poster_backups
                 # Also check USER_DB_CONTENT fallback for completeness
                 candidate_dirs = []
                 # Container config dir
@@ -1402,8 +1401,10 @@ def _resolve_ntfy_attachment(content_input, notification_category):
                 # Env-based db_content dir
                 db_content_dir = os.environ.get('USER_DB_CONTENT', '/user/db_content')
                 candidate_dirs.append(os.path.join(db_content_dir, "poster_backups"))
-                # Host fallback (when running on host, not container)
-                candidate_dirs.append("/home/mdoodle/quickstack/config/cli_debrid/poster_backups")
+                # Host config dir override (when running on host, not container)
+                host_config_dir = os.environ.get('CLI_DEBRID_CONFIG_DIR', '').strip()
+                if host_config_dir:
+                    candidate_dirs.append(os.path.join(host_config_dir, "poster_backups"))
                 # Also try relative to USER_DB_CONTENT parent
                 try:
                     candidate_dirs.append(os.path.join(os.path.dirname(db_content_dir), "poster_backups"))
@@ -1532,10 +1533,13 @@ def send_ntfy_notification(host, api_key, priority, topic, content, attach_url=N
     # Inside container, 127.0.0.1:2586 will fail; try ntfy as fallback
     if "127.0.0.1" in base or "192.168." in base:
         candidates.append(f"http://ntfy/{topic.lstrip('/')}")
-    # On host, ntfy may fail; try host loopback
+    # On host, ntfy may fail; try host loopback, plus an optional site-specific
+    # fallback (NTFY_HOST_FALLBACK_URL) for LAN/tailscale reachability.
     if base == "http://ntfy":
         candidates.append(f"http://127.0.0.1:2586/{topic.lstrip('/')}")
-        candidates.append(f"http://192.168.50.37:2586/{topic.lstrip('/')}")
+        host_fallback = os.environ.get('NTFY_HOST_FALLBACK_URL', '').strip()
+        if host_fallback:
+            candidates.append(f"{host_fallback.rstrip('/')}/{topic.lstrip('/')}")
     # Dedupe while preserving order
     seen = set()
     uniq_candidates = []
