@@ -154,6 +154,24 @@ class ScrapingQueue:
         # Assumes force_priority is a boolean or integer (0/1).
         # `not item.get('force_priority', False)` makes True values (forced) sort before False values.
         self.items.sort(key=lambda item: not item.get('force_priority', False))
+        # --- Freshness Priority Sorting ---
+        # New episodes (tier 0), then new movies (tier 1), ahead of everything
+        # else; stable sort keeps force-priority order within each tier. Runs
+        # after the force-priority sort so freshness is the primary key.
+        # Date-based: items age out of the tiers automatically as they get old.
+        try:
+            _fresh_window = int(get_setting("Queue", "freshness_window_days", 7) or 0)
+        except (TypeError, ValueError):
+            _fresh_window = 7
+        if _fresh_window > 0:
+            from datetime import timedelta as _td
+            _cut = (date.today() - _td(days=_fresh_window)).isoformat()
+            def _fresh_tier(item):
+                rel = str(item.get('release_date') or '')[:10]
+                if len(rel) < 10 or rel < _cut:
+                    return 2
+                return 0 if item.get('type') == 'episode' else 1
+            self.items.sort(key=_fresh_tier)
         # Keep temporarily deferred siblings behind independent work. This
         # sort must run after force-priority sorting so a blocked low-ID show
         # cannot starve every other show while its Adding sibling is wedged.

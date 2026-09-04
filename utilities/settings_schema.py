@@ -507,6 +507,16 @@ SETTINGS_SCHEMA = {
             "description": "Process Wanted items that have never been blacklisted (fresh adds / never scraped) before items that previously blacklisted with zero results. Failed items still retest on the blacklist cycle — they just queue last.",
             "default": False
         },
+        "freshness_window_days": {
+            "type": "integer",
+            "description": "New-episode/new-movie priority window: Wanted items aired or released within this many days always jump ahead of the regular queue (new TV episodes first, then new movies). 0 disables freshness priority.",
+            "default": 7
+        },
+        "freshness_max_per_cycle": {
+            "type": "integer",
+            "description": "Maximum freshness-priority items moved to Scraping per cycle, per tier (episodes and movies each get this budget). Bounds the jump-ahead so the regular queue cannot starve.",
+            "default": 25
+        },
         "idle_unblacklist_threshold": {
             "type": "integer",
             "description": "When the Wanted count is at or below this number, unblacklist items early (before blacklist_duration) to keep the pipeline busy. 0 = only when the queue is empty; -1 disables the backfill.",

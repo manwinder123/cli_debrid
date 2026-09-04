@@ -339,6 +339,49 @@ class WantedQueue:
             except Exception as e_blacklist:
                 logging.error(f"Error moving manually blacklisted items: {e_blacklist}", exc_info=True)
 
+            # 0b. Freshness priority: new TV episodes, then new movie releases.
+            # Aired/released within freshness_window_days always jump ahead of the
+            # regular queue (and of force-priority churn) so tonight's episode does
+            # not wait behind thousands of backfill rows. Bounded per tier per cycle.
+            # Date-based (not flag-based): nothing to set, clear, or go stale.
+            try:
+                freshness_window = int(get_setting("Queue", "freshness_window_days", 7) or 0)
+            except (TypeError, ValueError):
+                freshness_window = 7
+            try:
+                freshness_cap = int(get_setting("Queue", "freshness_max_per_cycle", 25) or 0)
+            except (TypeError, ValueError):
+                freshness_cap = 25
+            if freshness_window > 0 and freshness_cap > 0:
+                conn_fresh = None
+                try:
+                    conn_fresh = get_db_connection()
+                    for fresh_type, fresh_label in (("episode", "FreshEpisodes"), ("movie", "FreshMovies")):
+                        try:
+                            cursor_fresh = conn_fresh.execute(
+                                "SELECT * FROM media_items WHERE state = 'Wanted' "
+                                "AND (ghostlisted IS NULL OR ghostlisted = 0) "
+                                "AND type = ? AND release_date >= date('now', '-' || ? || ' days') "
+                                "ORDER BY release_date DESC LIMIT ?",
+                                (fresh_type, freshness_window, freshness_cap),
+                            )
+                            fresh_items = [dict(row) for row in cursor_fresh.fetchall()]
+                        except Exception as e_fresh_fetch:
+                            logging.error(f"[{fresh_label}] Error fetching fresh items: {e_fresh_fetch}", exc_info=True)
+                            continue
+                        for item in fresh_items:
+                            item_identifier_log = queue_manager.generate_identifier(item)
+                            try:
+                                logging.info(f"[{fresh_label}] Moving {item_identifier_log} to Scraping queue.")
+                                queue_manager.move_to_scraping(item, "Wanted")
+                                moved_to_scraping_count += 1
+                            except Exception as e_move_fresh:
+                                logging.error(f"[{fresh_label}] Error moving {item_identifier_log} to Scraping: {e_move_fresh}", exc_info=True)
+                except Exception as e_fresh:
+                    logging.error(f"Error processing freshness-priority items: {e_fresh}", exc_info=True)
+                finally:
+                    if conn_fresh:
+                        conn_fresh.close()
             # 1. Process Force Priority Items (NEW SECTION)
             # logging.info("Starting processing of force-prioritized items.")
             conn_force = None
